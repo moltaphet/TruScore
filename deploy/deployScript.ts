@@ -21,6 +21,10 @@ const CHALLENGE_BOND = 5n * 10n ** 18n;
 // be decided, not merely submitted.
 const RETRIES = 200;
 
+// Evidence host whitelisted right after deployment. The deployer is the governor,
+// and a fresh contract rejects every data_url until a domain is listed.
+const INITIAL_DOMAIN = "api.example.com";
+
 interface DeployReceipt {
   status?: number | string;
   statusName?: string;
@@ -40,6 +44,13 @@ interface TransactionFees {
 }
 
 interface DeployClient {
+  writeContract(input: {
+    address: string;
+    functionName: string;
+    args: unknown[];
+    value: bigint;
+    fees?: TransactionFees;
+  }): Promise<string>;
   initializeConsensusSmartContract(): Promise<void>;
   estimateTransactionFees(input: Record<string, never>): Promise<TransactionFees>;
   deployContract(input: {
@@ -122,5 +133,25 @@ export default async function main(client: DeployClient): Promise<string> {
   }
 
   console.log(`TruScore deployed at ${address}`);
+
+  // Make the contract usable immediately: the deployer is the governor.
+  const whitelistHash = await client.writeContract({
+    address,
+    functionName: "whitelist_domain",
+    args: [INITIAL_DOMAIN],
+    value: 0n,
+    fees: await client.estimateTransactionFees({}),
+  });
+  const whitelistReceipt = await client.waitForTransactionReceipt({
+    hash: whitelistHash,
+    waitUntil: "decided",
+    retries: RETRIES,
+  });
+  if (!isSuccessfulDeploymentReceipt(whitelistReceipt)) {
+    throw new Error(
+      `Deployed at ${address}, but whitelist_domain("${INITIAL_DOMAIN}") failed. Receipt: ${JSON.stringify(whitelistReceipt)}`,
+    );
+  }
+  console.log(`Whitelisted domain ${INITIAL_DOMAIN}`);
   return address;
 }

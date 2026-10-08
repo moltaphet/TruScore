@@ -299,12 +299,14 @@ locks, the treasury route, and zero-wei accounting across end-to-end lifecycles.
 | | |
 |---|---|
 | Network | GenLayer Studio Devnet (`studio-dev`, chain id 61997) |
-| Contract (previous revision) | `0x559E42702E90C1c88878771a94e1f1765E6712Ba` |
+| Contract | `0x5151A27F483451B09812d909EA9A0E1D1A3eC19d` (current code) |
 | Governor | `0x6Ec5cb7469a661B8E23B4867359893A25116eA19` (the deployer, a single EOA - **development only**) |
+| Whitelisted domains | `api.example.com` (added by `deploy/deployScript.ts` right after deployment) |
+| Previous revision | `0x559E42702E90C1c88878771a94e1f1765E6712Ba` (superseded) |
 
-The contract above predates the default dispute window, domain whitelist, loan fees, loan-closure requests,
-outbidding and `use_median`. **Redeploy with `genlayer deploy` to publish the current code**; a new address is
-issued, and the governor should be a multisig for anything beyond a devnet.
+`genlayer deploy` runs `deploy/deployScript.ts`, which deploys the contract and then calls `whitelist_domain`
+as the governor so the contract can serve score requests immediately. Change `INITIAL_DOMAIN` in the script
+for a real data source; the governor should be a multisig for anything beyond a devnet.
 
 ---
 
