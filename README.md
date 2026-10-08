@@ -19,8 +19,7 @@ deploy/deployScript.ts         `genlayer deploy` script (derives the network fee
 >
 > 1. **The Governor MUST be a multisig - never a single EOA.** The governor whitelists lenders and evidence
 >    domains and routes the treasury. Lender whitelisting and treasury payouts are **timelocked on-chain (3
->    days)**, which gives evaluators time to start unstaking if the governor goes rogue, but the delay does not
->    replace multisig control. Rotate nothing through a hot key.
+>    days)** and visible on-chain before it takes effect, but the delay does not replace multisig control. Rotate nothing through a hot key.
 > 2. **Treasury payout destinations MUST be an insurance pool or a multisig** that pays out to harmed
 >    lenders / evaluators. The contract cannot verify this on-chain (it only refuses the governor and the zero
 >    address); doing so would require an explicit insurance contract. Every payout is first announced with
@@ -63,7 +62,7 @@ deploy/deployScript.ts         `genlayer deploy` script (derives the network fee
 | **Evaluator** | Stakes GEN (>= `min_stake`, default 100 GEN), requests scores, earns the loan fee, and is liable for the loans it enables. |
 | **Challenger** | Anyone; posts a `challenge_bond` (default 5 GEN) and optional counter-evidence to dispute a `PENDING` score. |
 | **Lender** | Governor-whitelisted protocol. Registers each loan with `record_loan` (paying the evaluator's fee) **before** any default can be reported, and settles only its own loan. |
-| **Governor** | Manages the lender and evidence-domain whitelists and routes the **treasury** via the timelocked `propose_/execute_claim_treasury`. **Must be a multisig.** It can never touch evaluator stake or default proceeds, cannot be a lender and cannot send treasury funds to itself - but these are address checks only, so a single-key Governor could still use an alias address. Lender additions and treasury payouts therefore sit behind a **3-day timelock**: evaluators can see an alias being proposed and exit (unstake) before it becomes usable. A multisig remains strictly required. |
+| **Governor** | Manages the lender and evidence-domain whitelists and routes the **treasury** via the timelocked `propose_/execute_claim_treasury`. **Must be a multisig.** It can never touch evaluator stake or default proceeds, cannot be a lender and cannot send treasury funds to itself - but these are address checks only, so a single-key Governor could still use an alias address. Lender additions and treasury payouts therefore sit behind a **3-day timelock**: every proposal is visible on-chain before it takes effect. A multisig remains strictly required. |
 | **Validators** | GenLayer consensus: the leader runs the LLM analysis, validators re-run it, accept a score within +/-100, and agree on failures they independently reproduce. |
 
 ### Key parameters
@@ -165,13 +164,15 @@ credit API or an IPFS gateway). The evaluator's `data_url`, the challenger's `co
 `evil.trusted.com` are rejected). The whitelist is enforced when a URL is *accepted*; it is deliberately not
 re-checked while a dispute is being resolved, so removing a domain can never freeze an open dispute.
 
+> **Note:** The default deployment script whitelists `raw.githubusercontent.com` STRICTLY for devnet testing and demonstration purposes. On mainnet, domains must be strictly controlled APIs where neither party can freely edit the content.
+
 ### Governor timelocks
 The instant `whitelist_lender` and `claim_treasury` are gone. Lenders are added with
 `propose_whitelist_lender(lender)` -> (3 days) -> `execute_whitelist_lender(lender)`, and treasury payouts with
 `propose_claim_treasury(amount, destination)` -> (3 days) -> `execute_claim_treasury()` (one pending payout at a
 time; `cancel_*` withdraws a proposal; the amount is re-checked against the treasury at execution). A rogue
 governor's alias lender is therefore visible on-chain for three days before it can record a loan or report a
-default, enough time for evaluators to `initiate_unstake`. Removing a lender (`remove_lender`) stays instant
+default. Evaluators must monitor `get_pending_lender` and `get_pending_treasury`. If a malicious alias or suspicious payout is proposed, they cannot instantly unstake due to unbonding rules, but the 3-day window allows them to report the malicious action to the community or governor before it executes. Removing a lender (`remove_lender`) stays instant
 because it only reduces power.
 
 ### Strict unbonding queue
@@ -315,7 +316,7 @@ locks, the treasury route, and zero-wei accounting across end-to-end lifecycles.
 | Network | GenLayer Studio Devnet (`studio-dev`, chain id 61997) |
 | Contract | `0x4e7fB453f647dCE178B19fEC660d8c6C87e1CbCa` (current code) |
 | Governor | `0x6Ec5cb7469a661B8E23B4867359893A25116eA19` (the deployer, a single EOA - **development only**) |
-| Whitelisted domains | `raw.githubusercontent.com` (added by `deploy/deployScript.ts` right after deployment) |
+| Whitelisted domains | `raw.githubusercontent.com` (added by `deploy/deployScript.ts` right after deployment; devnet testing/demonstration only - see the note under *Evidence-domain whitelist*) |
 
 `genlayer deploy` runs `deploy/deployScript.ts`, which deploys the contract and then calls `whitelist_domain`
 as the governor so the contract can serve score requests immediately. Change `INITIAL_DOMAIN` in the script
@@ -366,8 +367,8 @@ genlayer write 0x4e7fB453f647dCE178B19fEC660d8c6C87e1CbCa request_score_update \
 
 ### Remaining trust assumptions
 
-1. **Governor.** The timelocks give evaluators a three-day exit window against an alias lender or treasury
-   drain, but a single-key governor remains a trusted role: it must be a multisig, and evaluators must watch
-   `get_pending_lender` / `get_pending_treasury`.
+1. **Governor.** The timelocks make an alias lender or treasury drain visible three days ahead, but they do not
+   let evaluators exit in that time (active exposure and the 7-day unbonding period block it). A single-key
+   governor remains a trusted role and must be a multisig. Evaluators must monitor `get_pending_lender` and `get_pending_treasury`. If a malicious alias or suspicious payout is proposed, they cannot instantly unstake due to unbonding rules, but the 3-day window allows them to report the malicious action to the community or governor before it executes.
 2. **Dispute judge.** The `dispute_default` verdict is an LLM judgment between two whitelisted sources; if both
    sources are unreliable or unavailable the outcome follows the 404 rules above.
