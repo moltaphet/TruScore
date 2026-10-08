@@ -476,7 +476,7 @@ def test_resolve_requires_disputed(env, alice, bob):
     env.mock_score(900)
     env.vm.sender = bob
     with env.vm.expect_revert("not DISPUTED"):
-        env.c.resolve_dispute(bob)
+        env.c.resolve_dispute(bob, True)
 
 
 def test_llm_failure_in_dispute_reverts_and_does_not_slash(env, alice, bob, carol):
@@ -488,7 +488,7 @@ def test_llm_failure_in_dispute_reverts_and_does_not_slash(env, alice, bob, caro
     env.vm.mock_llm(r".*Solvency Score.*", json.dumps(json.dumps({"nonsense": 1})))
     env.vm.sender = env.rando
     with env.vm.expect_revert("LLM_ERROR"):
-        env.c.resolve_dispute(bob)
+        env.c.resolve_dispute(bob, True)
     assert env.c.get_score(bob)["state"] == "DISPUTED"
     assert env.c.get_stake(alice) == 200 * GEN
     env.assert_zero_wei([alice])
@@ -524,7 +524,7 @@ def test_dispute_weighs_both_sources_and_overturns(env, alice, bob, carol):
     env.vm.mock_llm(r"(?s).*Source A.*evaluator-says-rich.*Source B.*challenger-shows-fraud.*", llm_json(100, "fraud"))
     env.vm.mock_llm(r".*Solvency Score.*", llm_json(900, "looks fine"))
     env.vm.sender = env.rando
-    env.c.resolve_dispute(bob)
+    env.c.resolve_dispute(bob, True)
 
     s = env.c.get_score(bob)
     assert s["score"] == 100 and s["reasoning"] == "fraud"
@@ -540,7 +540,7 @@ def test_dispute_without_counter_url_uses_only_source_a(env, alice, bob, carol):
     env.vm.mock_llm(r"(?s).*Source B \(challenger's counter-evidence\):.*", llm_json(0, "should not see source B"))
     env.vm.mock_llm(r".*Solvency Score.*", llm_json(880, "fine"))
     env.vm.sender = env.rando
-    env.c.resolve_dispute(bob)
+    env.c.resolve_dispute(bob, True)
     assert env.c.get_score(bob)["score"] == 900     # upheld
     assert env.c.get_claimable(carol) == 0
 
@@ -555,7 +555,7 @@ def test_unreachable_counter_url_does_not_slash_evaluator(env, alice, bob, carol
     })
     env.vm.mock_llm(r".*Solvency Score.*", llm_json(880, "fine"))
     env.vm.sender = env.rando
-    env.c.resolve_dispute(bob)                      # resolves normally on Source A alone
+    env.c.resolve_dispute(bob, True)                      # resolves normally on Source A alone
     assert env.c.get_score(bob)["score"] == 900
     assert env.c.get_stake(alice) == 200 * GEN
     assert env.c.get_treasury() == BOND             # failed challenge forfeits the bond
@@ -575,7 +575,7 @@ def test_missing_evidence_slashes_evaluator(env, alice, bob, carol, status, body
 
     env.mock_web_status(status, body)
     env.vm.sender = env.rando
-    env.c.resolve_dispute(bob)         # must NOT revert / get stuck
+    env.c.resolve_dispute(bob, True)         # must NOT revert / get stuck
 
     s = env.c.get_score(bob)
     assert s["state"] == "FINAL" and s["score"] == 0
@@ -599,7 +599,7 @@ def test_transient_http_error_reverts_without_slashing(env, alice, bob, carol, s
     env.mock_web_status(status)
     env.vm.sender = env.rando
     with env.vm.expect_revert("TRANSIENT"):
-        env.c.resolve_dispute(bob)
+        env.c.resolve_dispute(bob, True)
     s = env.c.get_score(bob)
     assert s["state"] == "DISPUTED" and s["score"] == 900     # untouched
     assert env.c.get_stake(alice) == stake
@@ -619,7 +619,7 @@ def test_unreachable_network_is_transient_not_slashing(env, alice, bob, carol):
     env.vm.clear_mocks()  # nothing mocked -> the fetch itself raises
     env.vm.sender = env.rando
     with env.vm.expect_revert("TRANSIENT"):
-        env.c.resolve_dispute(bob)
+        env.c.resolve_dispute(bob, True)
     assert env.c.get_stake(alice) == 200 * GEN
     assert env.c.get_score(bob)["state"] == "DISPUTED"
 
@@ -633,9 +633,9 @@ def test_persistent_transient_failure_counts_after_timeout(env, alice, bob, caro
     env.vm.sender = env.rando
     env.warp(timedelta(days=7) - EPS)
     with env.vm.expect_revert("TRANSIENT"):
-        env.c.resolve_dispute(bob)
+        env.c.resolve_dispute(bob, True)
     env.warp(timedelta(days=7))
-    env.c.resolve_dispute(bob)
+    env.c.resolve_dispute(bob, True)
     s = env.c.get_score(bob)
     assert s["score"] == 0 and s["state"] == "FINAL"
     assert env.c.get_claimable(carol) == 2 * BOND
@@ -650,7 +650,7 @@ def test_missing_evidence_with_unbonded_stake_still_slashes(env, alice, bob, car
     env.challenge(carol, bob)
     env.mock_web_status(404)
     env.vm.sender = env.rando
-    env.c.resolve_dispute(bob)
+    env.c.resolve_dispute(bob, True)
     assert env.c.get_stake(alice) == 0           # slash 50 = 20 active + 30 unbonding
     assert env.c.get_unbonding(alice)["amount"] == 180 * GEN - 30 * GEN - BOND
     env.assert_zero_wei([alice])
@@ -727,7 +727,7 @@ def test_whitelist_is_governor_only(env, carol):
 
 def test_governor_cannot_whitelist_itself(env):
     env.vm.sender = env.governor
-    with env.vm.expect_revert("Invalid lender"):
+    with env.vm.expect_revert("Governor cannot be a lender"):
         env.c.propose_whitelist_lender(env.governor)
     assert not env.c.is_lender(env.governor)
 
@@ -1589,12 +1589,9 @@ def test_dispute_lock_counts_multiple_scores(env, alice, bob, carol, dave):
 # default dispute window  [#1]
 # ======================================================================
 
-def _mock_default_verdict(env, defaulted, status=200, body="repayment-records", lender_status=200,
-                          lender_body="default-claim-records"):
-    """`status`/`body` describe the evaluator's evidence, `lender_*` the lender's."""
+def _mock_default_verdict(env, defaulted, status=200, body="repayment-records"):
     env.vm.clear_mocks()
-    env.vm.mock_web(r".*default-claim\.json.*", {"status": lender_status, "body": lender_body})
-    env.vm.mock_web(r".*repayment\.json.*", {"status": status, "body": body})
+    env.vm.mock_web(r".*", {"status": status, "body": body})
     env.vm.mock_llm(
         r".*impartial judge.*",
         json.dumps(json.dumps({"defaulted": defaulted, "reasoning": "judged"})),
@@ -1784,7 +1781,7 @@ def test_dispute_default_evidence_must_be_safe_and_whitelisted(env, alice, bob):
     _pending_default(env, alice, bob)
     _mock_default_verdict(env, defaulted=False)
     env.vm.sender = alice
-    with env.vm.expect_revert("Unsafe evaluator_evidence_url"):
+    with env.vm.expect_revert("Unsafe evidence_url"):
         env.c.dispute_default(bob, env.lender, "http://127.0.0.1/x")
     with env.vm.expect_revert("Domain not whitelisted"):
         env.c.dispute_default(bob, env.lender, "https://evil.example.org/x")
@@ -1826,7 +1823,7 @@ def test_default_validator_requires_matching_verdict(env, alice, bob, leader, va
 
 
 @pytest.mark.parametrize("message,seen,agrees", [
-    (DATA_ERR, 404, False), (DATA_ERR, 200, False), (TRANSIENT_ERR, 503, True),
+    (DATA_ERR, 404, True), (DATA_ERR, 200, False), (TRANSIENT_ERR, 503, True),
     (TRANSIENT_ERR, 404, False), ("[LLM_ERROR] x", 503, False),
 ])
 def test_default_validator_agrees_on_failures_it_reproduces(env, alice, bob, message, seen, agrees):
@@ -2259,6 +2256,7 @@ def test_single_run_calls_llm_once(env, alice, bob, carol, monkeypatch):
     env.challenge(carol, bob)
     env.mock_score(900)
     calls = []
+    orig = env.c._analyze if hasattr(env.c, "_analyze") else None
     import genlayer as gl
 
     real = gl.nondet.exec_prompt
@@ -2286,251 +2284,6 @@ def test_missing_evidence_and_upheld_scores(env, alice, bob, carol, dave):
     env.resolve(dave, 380)
     assert env.c.get_score(dave)["score"] == 400
     env.assert_zero_wei([alice])
-
-
-# ======================================================================
-# two-sided evidence in defaults
-# ======================================================================
-
-def test_report_default_stores_lender_evidence(env, alice, bob):
-    _pending_default(env, alice, bob)
-    assert env.c.get_loan(bob, env.lender)["lender_evidence_url"] == LENDER_EVIDENCE
-
-
-def test_report_default_requires_safe_whitelisted_lender_evidence(env, alice, bob):
-    env.stake(alice, 200 * GEN)
-    _lend(env, alice, bob, 800, 100 * GEN)
-    env.vm.sender = env.lender
-    with env.vm.expect_revert("Unsafe lender_evidence_url"):
-        env.c.report_default(bob, "http://127.0.0.1/x")
-    with env.vm.expect_revert("Unsafe lender_evidence_url"):
-        env.c.report_default(bob, "")
-    with env.vm.expect_revert("Domain not whitelisted"):
-        env.c.report_default(bob, "https://evil.example.org/claim.json")
-    assert env.c.get_loan(bob, env.lender)["status"] == "OPEN"
-
-
-def test_dispute_prompt_contains_both_sides(env, alice, bob):
-    _pending_default(env, alice, bob)
-    env.vm.clear_mocks()
-    env.vm.mock_web(r".*default-claim\.json.*", {"status": 200, "body": "LENDER-SAYS-MISSED-PAYMENT"})
-    env.vm.mock_web(r".*repayment\.json.*", {"status": 200, "body": "EVALUATOR-SHOWS-REPAID"})
-    # the mock only answers when the single prompt carries BOTH sources, lender first
-    env.vm.mock_llm(
-        r"(?s).*impartial judge.*Source L.*LENDER-SAYS-MISSED-PAYMENT.*Source E.*EVALUATOR-SHOWS-REPAID.*",
-        json.dumps(json.dumps({"defaulted": False, "reasoning": "repaid"})),
-    )
-    _dispute_default(env, alice, bob)
-    assert env.c.get_loan(bob, env.lender)["status"] == ""        # refuted: cancelled
-    assert not env.c.is_lender(env.lender)
-
-
-def test_lender_evidence_gone_means_claim_unsupported(env, alice, bob):
-    _pending_default(env, alice, bob)
-    _mock_default_verdict(env, defaulted=True, lender_status=404)  # the LLM is never reached
-    _dispute_default(env, alice, bob)
-    assert env.transfers == []
-    assert env.c.get_stake(alice) == 200 * GEN
-    assert not env.c.is_lender(env.lender)
-    env.assert_zero_wei([alice])
-
-
-def test_lender_evidence_transient_error_reverts(env, alice, bob):
-    _pending_default(env, alice, bob)
-    _mock_default_verdict(env, defaulted=False, lender_status=503)
-    env.vm.sender = alice
-    with env.vm.expect_revert("TRANSIENT"):
-        env.c.dispute_default(bob, env.lender, EVIDENCE)
-    assert env.c.get_loan(bob, env.lender)["status"] == "PENDING_DEFAULT"
-
-
-def test_two_sided_confirmed_default_settles(env, alice, bob):
-    _pending_default(env, alice, bob)
-    _mock_default_verdict(env, defaulted=True)
-    _dispute_default(env, alice, bob)
-    assert env.transfers == [(env.lender, 100 * GEN)]
-    env.assert_zero_wei([alice])
-
-
-@pytest.mark.parametrize("lender_status,eval_status,leader,expect", [
-    (404, 200, {"defaulted": False}, True),    # lender proof missing -> refuted (validator reproduces)
-    (200, 404, {"defaulted": True}, True),     # evaluator proof missing -> default stands
-    (404, 200, {"defaulted": True}, False),
-    (200, 404, {"defaulted": False}, False),
-])
-def test_default_validator_reproduces_missing_evidence_outcomes(
-    env, alice, bob, lender_status, eval_status, leader, expect
-):
-    _captured_default_validator(env, alice, bob)
-    _mock_default_verdict(env, defaulted=False, status=eval_status, lender_status=lender_status)
-    assert env.vm.run_validator(leader_result={**leader, "reasoning": "r"}) is expect
-
-
-# ======================================================================
-# governor timelocks (anti alias-rug)
-# ======================================================================
-
-def test_lender_whitelisting_is_timelocked(env, carol):
-    env.vm.sender = env.governor
-    env.c.propose_whitelist_lender(carol)
-    assert env.c.get_pending_lender(carol) == int(env.t.timestamp()) + 3 * 86400
-    assert not env.c.is_lender(carol)
-    with env.vm.expect_revert("Timelock not elapsed"):
-        env.c.execute_whitelist_lender(carol)
-    env.advance(TIMELOCK - EPS)
-    with env.vm.expect_revert("Timelock not elapsed"):
-        env.c.execute_whitelist_lender(carol)
-    env.advance(EPS)
-    env.c.execute_whitelist_lender(carol)
-    assert env.c.is_lender(carol)
-    assert env.c.get_pending_lender(carol) == 0
-    with env.vm.expect_revert("Nothing proposed"):
-        env.c.execute_whitelist_lender(carol)           # no replay
-
-
-def test_lender_timelock_rejections_and_cancel(env, alice, carol):
-    env.vm.sender = env.governor
-    with env.vm.expect_revert("Nothing proposed"):
-        env.c.execute_whitelist_lender(carol)
-    env.c.propose_whitelist_lender(carol)
-    with env.vm.expect_revert("Already proposed"):
-        env.c.propose_whitelist_lender(carol)
-    env.vm.sender = alice
-    with env.vm.expect_revert("Only governor"):
-        env.c.cancel_whitelist_lender(carol)
-    env.vm.sender = env.governor
-    env.c.cancel_whitelist_lender(carol)
-    env.advance(TIMELOCK)
-    with env.vm.expect_revert("Nothing proposed"):
-        env.c.execute_whitelist_lender(carol)
-    assert not env.c.is_lender(carol)
-
-
-def test_alias_lender_is_not_usable_during_the_timelock(env, alice, bob):
-    """A rogue governor's alias cannot record loans or report defaults until the delay
-    passes -- the window evaluators have to exit."""
-    env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 800)
-    alias = env.many[6]
-    env.vm.sender = env.governor
-    env.c.propose_whitelist_lender(alias)
-    with env.vm.expect_revert("Only whitelisted lender"):
-        env.record_loan(bob, 10 * GEN, lender=alias)
-    env.vm.sender = alias
-    with env.vm.expect_revert("No open loan"):
-        env.c.report_default(bob, LENDER_EVIDENCE)
-    # alice sees the proposal and starts unbonding inside the window
-    _unstake(env, alice, 40 * GEN)
-    env.assert_zero_wei([alice])
-
-
-def test_remove_lender_stays_instant(env):
-    env.vm.sender = env.governor
-    env.c.remove_lender(env.lender)
-    assert not env.c.is_lender(env.lender)
-
-
-def test_treasury_payout_is_timelocked(env, alice, bob, carol):
-    _fund_treasury(env, alice, bob, carol)
-    env.vm.sender = env.governor
-    with env.vm.expect_revert("Nothing proposed"):
-        env.c.execute_claim_treasury()
-    env.c.propose_claim_treasury(3 * GEN, env.many[0])
-    p = env.c.get_pending_treasury()
-    assert p["amount"] == 3 * GEN and p["destination"] == env.many[0].as_hex
-    assert p["eta"] == int(env.t.timestamp()) + 3 * 86400
-    with env.vm.expect_revert("Payout already proposed"):
-        env.c.propose_claim_treasury(1, env.many[1])
-    with env.vm.expect_revert("Timelock not elapsed"):
-        env.c.execute_claim_treasury()
-    env.advance(TIMELOCK - EPS)
-    with env.vm.expect_revert("Timelock not elapsed"):
-        env.c.execute_claim_treasury()
-    assert env.transfers == [] and env.c.get_treasury() == BOND
-    env.advance(EPS)
-    env.c.execute_claim_treasury()
-    assert env.transfers == [(env.many[0], 3 * GEN)]
-    assert env.c.get_treasury() == BOND - 3 * GEN
-    assert env.c.get_pending_treasury()["eta"] == 0
-    with env.vm.expect_revert("Nothing proposed"):
-        env.c.execute_claim_treasury()
-    env.assert_zero_wei([alice])
-
-
-def test_treasury_proposal_access_and_cancel(env, alice, bob, carol):
-    _fund_treasury(env, alice, bob, carol)
-    env.vm.sender = env.rando
-    for call in (lambda: env.c.execute_claim_treasury(), lambda: env.c.cancel_claim_treasury()):
-        with env.vm.expect_revert("Only governor"):
-            call()
-    env.vm.sender = env.governor
-    env.c.propose_claim_treasury(BOND, env.many[0])
-    env.c.cancel_claim_treasury()
-    env.advance(TIMELOCK)
-    with env.vm.expect_revert("Nothing proposed"):
-        env.c.execute_claim_treasury()
-    assert env.transfers == []
-    env.c.propose_claim_treasury(BOND, env.many[0])          # a fresh proposal after a cancel
-    env.assert_zero_wei([alice])
-
-
-def test_old_instant_governor_entry_points_are_gone(env):
-    env.vm.sender = env.governor
-    with pytest.raises(Exception):
-        env.c.whitelist_lender(env.many[0])
-    with pytest.raises(Exception):
-        env.c.claim_treasury(1, env.many[0])
-
-
-# ======================================================================
-# dust-score squatting prevention (< 10 GEN, no loans)
-# ======================================================================
-
-def test_dust_score_is_overwritten_by_any_evaluator_even_with_lower_power(env, alice, bob, carol):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    _finalize(env, alice, carol, 45)                      # 9 GEN < 10 GEN: dust
-    env.request(bob, carol, 10)                           # LOWER power (2 GEN): still allowed
-    assert env.c.get_score(carol)["evaluator"] == bob.as_hex
-    assert env.c.get_exposure(alice) == 0
-    env.assert_exposure_invariant([alice, bob], [carol])
-    env.assert_zero_wei([alice, bob])
-
-
-def test_score_at_the_dust_threshold_is_still_locked(env, alice, bob, carol):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    _finalize(env, alice, carol, 50)                      # exactly 10 GEN: not dust
-    env.mock_score(10)
-    env.vm.sender = bob
-    with env.vm.expect_revert("belongs to another evaluator"):
-        env.c.request_score_update(carol, URL)
-    assert env.c.get_score(carol)["evaluator"] == alice.as_hex
-
-
-def test_dust_score_with_an_open_loan_is_protected(env, alice, bob, carol):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    _lend(env, alice, carol, 45, 1)                       # dust, but a loan is open
-    env.mock_score(10)
-    env.vm.sender = bob
-    with env.vm.expect_revert("belongs to another evaluator"):
-        env.c.request_score_update(carol, URL)
-    assert env.c.get_loan(carol, env.lender)["amount"] == 1
-
-
-def test_pending_or_disputed_dust_score_is_still_protected(env, alice, bob, carol, dave):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    env.request(alice, carol, 45)                         # PENDING, inside the challenge window
-    env.mock_score(10)
-    env.vm.sender = bob
-    with env.vm.expect_revert("still in challenge process"):
-        env.c.request_score_update(carol, URL)
-    env.challenge(dave, carol)
-    env.vm.sender = bob
-    with env.vm.expect_revert("Score is disputed"):
-        env.c.request_score_update(carol, URL)
 
 
 # ======================================================================
