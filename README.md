@@ -63,7 +63,7 @@ deploy/deployScript.ts         `genlayer deploy` script (derives the network fee
 | **Evaluator** | Stakes GEN (>= `min_stake`, default 100 GEN), requests scores, earns the loan fee, and is liable for the loans it enables. |
 | **Challenger** | Anyone; posts a `challenge_bond` (default 5 GEN) and optional counter-evidence to dispute a `PENDING` score. |
 | **Lender** | Governor-whitelisted protocol. Registers each loan with `record_loan` (paying the evaluator's fee) **before** any default can be reported, and settles only its own loan. |
-| **Governor** | Manages the lender and evidence-domain whitelists and routes the **treasury** via `claim_treasury`. Must be a multisig/timelock. It can never touch evaluator stake or default proceeds, cannot be a lender, and cannot send treasury funds to itself. |
+| **Governor** | Manages the lender and evidence-domain whitelists and routes the **treasury** via `claim_treasury`. **Must be a multisig/timelock.** The contract never lets it move evaluator stake or default proceeds, and it cannot be a lender or name itself as the treasury destination - but these are address checks only: a single-key Governor CAN bypass them by using an alias address (a second account it controls) as lender or treasury destination. That is why a Multisig/Timelock is strictly required, not optional. |
 | **Validators** | GenLayer consensus: the leader runs the LLM analysis, validators re-run it, accept a score within +/-100, and agree on failures they independently reproduce. |
 
 ### Key parameters
@@ -299,14 +299,34 @@ locks, the treasury route, and zero-wei accounting across end-to-end lifecycles.
 | | |
 |---|---|
 | Network | GenLayer Studio Devnet (`studio-dev`, chain id 61997) |
-| Contract | `0x5151A27F483451B09812d909EA9A0E1D1A3eC19d` (current code) |
+| Contract | `0x3C551e76Db6BAaCf9f20BeA8b349087b12d94180` (current code) |
 | Governor | `0x6Ec5cb7469a661B8E23B4867359893A25116eA19` (the deployer, a single EOA - **development only**) |
-| Whitelisted domains | `api.example.com` (added by `deploy/deployScript.ts` right after deployment) |
-| Previous revision | `0x559E42702E90C1c88878771a94e1f1765E6712Ba` (superseded) |
+| Whitelisted domains | `raw.githubusercontent.com` (added by `deploy/deployScript.ts` right after deployment) |
 
 `genlayer deploy` runs `deploy/deployScript.ts`, which deploys the contract and then calls `whitelist_domain`
 as the governor so the contract can serve score requests immediately. Change `INITIAL_DOMAIN` in the script
-for a real data source; the governor should be a multisig for anything beyond a devnet.
+for a real data source.
+
+### Testing `request_score_update`
+
+Register an evaluator (`register_evaluator`, value >= 100 GEN), then call `request_score_update` with a
+`data_url` on the whitelisted host. Sample (dummy borrower profile; the file must be published at this path,
+for example in a public repo, before it is fetched):
+
+```
+borrower: 0x000000000000000000000000000000000000dEaD
+data_url: https://raw.githubusercontent.com/truscore-demo/sample-data/main/borrower.json
+```
+
+```json
+{"wallet": "0x000000000000000000000000000000000000dEaD", "repaid_loans": 12, "defaults": 0,
+ "avg_collateral_ratio": 1.8, "account_age_days": 540}
+```
+
+```
+genlayer write 0x3C551e76Db6BAaCf9f20BeA8b349087b12d94180 request_score_update \
+  --args 0x000000000000000000000000000000000000dEaD https://raw.githubusercontent.com/truscore-demo/sample-data/main/borrower.json
+```
 
 ---
 
@@ -329,3 +349,12 @@ for a real data source; the governor should be a multisig for anything beyond a 
 - Liability ends once an evaluator's funds have fully left the contract after the unbonding period.
 - A score is only as good as its LLM and data source; the median and thresholds bound noise, not bias in the
   source data.
+
+### Final known limitations
+
+1. **Dispute judge.** In `dispute_default` the evaluator effectively acts as its own judge: the current architecture
+   does not force the lender to provide on-chain counter-evidence, so the verdict rests on the evidence URL the
+   evaluator supplies.
+2. **Treasury bypass.** The `claim_treasury` destination restriction can be bypassed if the governor uses an alias
+   address (the check only rejects the governor's own address and the zero address). Mitigation: the Governor
+   must be a Multisig/Timelock.

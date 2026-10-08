@@ -23,7 +23,7 @@ const RETRIES = 200;
 
 // Evidence host whitelisted right after deployment. The deployer is the governor,
 // and a fresh contract rejects every data_url until a domain is listed.
-const INITIAL_DOMAIN = "api.example.com";
+const INITIAL_DOMAIN = "raw.githubusercontent.com";
 
 interface DeployReceipt {
   status?: number | string;
