@@ -8,15 +8,24 @@ GEN = 10**18
 MIN_STAKE = 100 * GEN
 BOND = 5 * GEN
 URL = "https://data.example.com/borrower.json"
+COUNTER = "https://counter.example.com/evidence.json"
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
 WEEK = timedelta(days=7)
 TTL = timedelta(days=30)
+LOAN_TTL = timedelta(days=365)
 OVERTURN_THRESHOLD = 250
 EPS = timedelta(seconds=1)
+
+DATA_ERR = "[DATA_UNAVAILABLE] evidence not found"
+TRANSIENT_ERR = "[TRANSIENT] evidence temporarily unavailable"
 
 
 def iso(dt):
     return dt.isoformat().replace("+00:00", "Z")
+
+
+def llm_json(score, reasoning="r"):
+    return json.dumps(json.dumps({"score": score, "reasoning": reasoning}))
 
 
 class Env:
@@ -26,7 +35,8 @@ class Env:
         self.vm = vm
         self.c = contract
         self.deposited = 0
-        self.transfers = []  # (recipient, amount): withdraw() and direct lender payouts
+        self.transfers = []  # (recipient, amount): withdraw(), default and treasury payouts
+        self.loan_pairs = set()
         self.t = T0
         vm.warp(iso(T0))
 
@@ -39,6 +49,23 @@ class Env:
         self.t = self.t + delta
         self.vm.warp(iso(self.t))
 
+    # -- mocks ---------------------------------------------------------
+    def mock_score(self, score, reasoning="r"):
+        self.vm.clear_mocks()
+        self.vm.mock_web(r".*", {"status": 200, "body": '{"revenue": 100}'})
+        self.vm.mock_llm(r".*Solvency Score.*", llm_json(score, reasoning))
+
+    def mock_passes(self, scores):
+        self.vm.clear_mocks()
+        self.vm.mock_web(r".*", {"status": 200, "body": '{"revenue": 100}'})
+        for i, sc in enumerate(scores, 1):
+            self.vm.mock_llm(rf".*Analysis pass {i} of {len(scores)}.*", llm_json(sc, f"pass{i}"))
+
+    def mock_web_status(self, status, body="x"):
+        self.vm.clear_mocks()
+        self.vm.mock_web(r".*", {"status": status, "body": body})
+        self.vm.mock_llm(r".*Solvency Score.*", llm_json(500, "x"))
+
     # -- actions -------------------------------------------------------
     def stake(self, who, amount):
         self.vm.sender = who
@@ -49,35 +76,16 @@ class Env:
             self.vm.value = 0
         self.deposited += amount
 
-    def mock_score(self, score, reasoning="r"):
-        self.vm.clear_mocks()
-        self.vm.mock_web(r".*", {"status": 200, "body": '{"revenue": 100}'})
-        self.vm.mock_llm(r".*Solvency Score.*", json.dumps(json.dumps({"score": score, "reasoning": reasoning})))
-
-    def mock_passes(self, scores):
-        self.vm.clear_mocks()
-        self.vm.mock_web(r".*", {"status": 200, "body": '{"revenue": 100}'})
-        for i, sc in enumerate(scores, 1):
-            self.vm.mock_llm(
-                rf".*Analysis pass {i} of {len(scores)}.*",
-                json.dumps(json.dumps({"score": sc, "reasoning": f"pass{i}"})),
-            )
-
-    def mock_web_status(self, status, body=""):
-        self.vm.clear_mocks()
-        self.vm.mock_web(r".*", {"status": status, "body": body})
-        self.vm.mock_llm(r".*Solvency Score.*", json.dumps(json.dumps({"score": 500, "reasoning": "x"})))
-
     def request(self, evaluator, borrower, score):
         self.mock_score(score)
         self.vm.sender = evaluator
         self.c.request_score_update(borrower, URL)
 
-    def challenge(self, who, borrower, value=BOND):
+    def challenge(self, who, borrower, counter_url="", value=BOND):
         self.vm.sender = who
         self.vm.value = value
         try:
-            self.c.challenge_score(borrower)
+            self.c.challenge_score(borrower, counter_url)
         finally:
             self.vm.value = 0
         self.deposited += value
@@ -92,18 +100,31 @@ class Env:
         self.vm.sender = self.rando
         self.c.resolve_dispute(borrower)
 
-    def default(self, borrower, loss, lender=None):
+    def finalize(self, borrower):
+        self.vm.sender = self.rando
+        self.c.finalize_score(borrower)
+
+    def record_loan(self, borrower, amount, lender=None):
+        who = lender if lender is not None else self.lender
+        self.vm.sender = who
+        self.c.record_loan(borrower, amount)
+        self.loan_pairs.add((borrower, who))
+
+    def close_loan(self, borrower, lender=None):
         self.vm.sender = lender if lender is not None else self.lender
-        self.c.report_default(borrower, loss)
+        self.c.close_loan(borrower)
+
+    def default(self, borrower, lender=None):
+        who = lender if lender is not None else self.lender
+        self.vm.sender = who
+        self.c.report_default(borrower)
+        self.loan_pairs.add((borrower, who))
 
     def withdraw(self, who):
         self.vm.sender = who
         return self.c.withdraw()
 
-    def finalize(self, borrower):
-        self.vm.sender = self.rando
-        self.c.finalize_score(borrower)
-
+    # -- invariants ----------------------------------------------------
     def assert_zero_wei(self, evaluators=()):
         a = self.c.get_accounting()
         assert a["total_deposited"] == self.deposited
@@ -117,17 +138,23 @@ class Env:
         assert a["treasury"] == self.c.get_treasury()
 
     def assert_exposure_invariant(self, evaluators, borrowers):
-        """active_exposure per evaluator == sum of its records' exposure."""
+        """active_exposure == unlent capacity of live records + open-loan exposure."""
         for e in evaluators:
-            total = 0
+            caps = 0
             for b in borrowers:
                 try:
                     sc = self.c.get_score(b)
                 except Exception:
                     continue
                 if sc["evaluator"] == e.as_hex:
-                    total += sc["exposure"]
-            assert self.c.get_exposure(e) == total
+                    caps += sc["exposure"]
+            loans = sum(
+                self.c.get_loan(b, l)["amount"]
+                for (b, l) in self.loan_pairs
+                if self.c.get_loan(b, l)["evaluator"] == e.as_hex
+            )
+            assert self.c.get_loan_exposure(e) == loans
+            assert self.c.get_exposure(e) == caps + loans
 
 
 @pytest.fixture
@@ -149,10 +176,12 @@ def env(direct_vm, direct_deploy, monkeypatch):
 
     e.governor = Address(c.get_governor())
     e.lender = Address(b"\x11" * 20)
+    e.lender2 = Address(b"\x12" * 20)
     e.rando = Address(b"\x22" * 20)
     e.many = [Address(bytes([0x40 + i]) * 20) for i in range(8)]
     direct_vm.sender = e.governor
     c.whitelist_lender(e.lender)
+    c.whitelist_lender(e.lender2)
     return e
 
 
@@ -188,6 +217,12 @@ def _finalize(env, evaluator, borrower, score):
     env.finalize(borrower)
 
 
+def _lend(env, evaluator, borrower, score, amount, lender=None):
+    """Score a borrower, finalize it and record one loan against it."""
+    _finalize(env, evaluator, borrower, score)
+    env.record_loan(borrower, amount, lender)
+
+
 # ======================================================================
 # registration
 # ======================================================================
@@ -216,7 +251,7 @@ def test_registration_rejections(env, alice):
 # SSRF
 # ======================================================================
 
-@pytest.mark.parametrize("url", [
+BAD_URLS = [
     "http://127.0.0.1/x", "http://localhost/x", "http://sub.localhost/x",
     "http://169.254.169.254/latest/meta-data", "http://10.0.0.1/x",
     "http://192.168.1.1/x", "http://172.16.0.1/x", "http://0.0.0.0/x",
@@ -225,13 +260,26 @@ def test_registration_rejections(env, alice):
     "ftp://example.com/x", "file:///etc/passwd", "gopher://example.com",
     "HTTP://example.com/x", "javascript:alert(1)", "http:///x", "",
     "http://example.com/a b", "http://service.internal/x",
-])
+]
+
+
+@pytest.mark.parametrize("url", BAD_URLS)
 def test_ssrf_rejected(env, alice, bob, url):
     env.stake(alice, MIN_STAKE)
     env.mock_score(500)
     env.vm.sender = alice
     with env.vm.expect_revert("Unsafe data_url"):
         env.c.request_score_update(bob, url)
+
+
+@pytest.mark.parametrize("url", [u for u in BAD_URLS if u])
+def test_ssrf_rejected_for_counter_url(env, alice, bob, carol, url):
+    env.stake(alice, MIN_STAKE)
+    env.request(alice, bob, 500)
+    with env.vm.expect_revert("Unsafe counter_url"):
+        env.challenge(carol, bob, counter_url=url)
+    env.vm.value = 0
+    assert env.c.get_score(bob)["state"] == "PENDING"
 
 
 def test_ssrf_allows_public(env, alice, bob):
@@ -259,7 +307,7 @@ def test_unchallenged_finalization(env, alice, bob, carol):
     s = env.c.get_score(bob)
     assert s["score"] == 800 and s["state"] == "PENDING" and s["challenger"] == ""
     assert s["timestamp"] == int(T0.timestamp())
-    assert s["exposure"] == 160 * GEN
+    assert s["exposure"] == 160 * GEN and s["loaned"] == 0
 
     env.vm.sender = carol
     with env.vm.expect_revert("Challenge window still open"):
@@ -281,7 +329,7 @@ def test_challenge_window_and_rules(env, alice, bob, carol):
         env.challenge(carol, bob)
     env.vm.value = 0
 
-    env.request(alice, env.many[0], 100)          # a fresh PENDING score (bob's is still live)
+    env.request(alice, env.many[0], 100)
     with env.vm.expect_revert("own score"):
         env.challenge(alice, env.many[0])
     with env.vm.expect_revert("exactly the challenge bond"):
@@ -291,7 +339,7 @@ def test_challenge_window_and_rules(env, alice, bob, carol):
 
 
 # ======================================================================
-# dispute: overturned / upheld (median + widened threshold)  [fix 5]
+# dispute: overturned / upheld (median + widened threshold)
 # ======================================================================
 
 def test_dispute_overturned(env, alice, bob, carol):
@@ -340,7 +388,7 @@ def test_dispute_upheld(env, alice, bob, carol, new_score):
     env.resolve(bob, new_score)  # diff <= 250 (650 is exactly 250)
 
     s = env.c.get_score(bob)
-    assert s["state"] == "FINAL" and s["score"] == 900  # original stands
+    assert s["state"] == "FINAL" and s["score"] == 900
     assert env.c.get_stake(alice) == stake
     assert env.c.get_treasury() == BOND
     assert env.c.get_claimable(carol) == 0
@@ -374,24 +422,17 @@ def test_validator_tolerance_noise_never_slashes(env, alice, bob, carol):
     env.assert_zero_wei([alice])
 
 
-def test_threshold_is_wider_than_two_validator_tolerances():
-    assert OVERTURN_THRESHOLD > 2 * 100  # L1 tolerance: two honest runs can differ by 200
-
-
 def test_dispute_uses_median_of_three(env, alice, bob, carol, dave):
     env.stake(alice, 300 * GEN)
     env.request(alice, bob, 900)
     env.request(alice, dave, 100)
     env.challenge(carol, bob)
     env.challenge(carol, dave)
-    # one wild outlier cannot overturn: median(100, 890, 900) = 890
-    env.resolve_passes(bob, [100, 890, 900])
+    env.resolve_passes(bob, [100, 890, 900])      # median 890: one wild run cannot overturn
     assert env.c.get_score(bob)["score"] == 900
     assert env.c.get_claimable(carol) == 0
-    # two low passes do: median(100, 100, 900) -> 100... vs old 100? use 900 original
     env.assert_zero_wei([alice])
-    # outlier in the other direction on a low original score
-    env.resolve_passes(dave, [900, 120, 110])
+    env.resolve_passes(dave, [900, 120, 110])     # median 120: upheld vs 100
     assert env.c.get_score(dave)["score"] == 100
     env.assert_zero_wei([alice])
 
@@ -400,7 +441,7 @@ def test_dispute_median_overturns_with_two_low_passes(env, alice, bob, carol):
     env.stake(alice, 200 * GEN)
     env.request(alice, bob, 900)
     env.challenge(carol, bob)
-    env.resolve_passes(bob, [100, 120, 900])  # median 120
+    env.resolve_passes(bob, [100, 120, 900])      # median 120
     assert env.c.get_score(bob)["score"] == 120
     assert env.c.get_claimable(carol) == 2 * BOND
     env.assert_zero_wei([alice])
@@ -431,17 +472,85 @@ def test_llm_failure_in_dispute_reverts_and_does_not_slash(env, alice, bob, caro
 
 
 # ======================================================================
-# 404 evidence trap  [fix 6]
+# counter-evidence  [#4]
 # ======================================================================
 
-@pytest.mark.parametrize("status,body", [(404, "nope"), (403, "x"), (500, "x"), (200, "")])
+def _web_by_url(env, mapping):
+    env.vm.clear_mocks()
+    for pattern, (status, body) in mapping.items():
+        env.vm.mock_web(pattern, {"status": status, "body": body})
+
+
+def test_counter_url_is_stored(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    env.request(alice, bob, 900)
+    env.challenge(carol, bob, counter_url=COUNTER)
+    assert env.c.get_score(bob)["counter_url"] == COUNTER
+
+
+def test_dispute_weighs_both_sources_and_overturns(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    env.request(alice, bob, 900)
+    env.challenge(carol, bob, counter_url=COUNTER)
+
+    _web_by_url(env, {
+        r"data\.example\.com": (200, "evaluator-says-rich"),
+        r"counter\.example\.com": (200, "challenger-shows-fraud"),
+    })
+    # Only a prompt carrying BOTH sources reaches the low-score answer.
+    env.vm.mock_llm(r"(?s).*Source A.*evaluator-says-rich.*Source B.*challenger-shows-fraud.*", llm_json(100, "fraud"))
+    env.vm.mock_llm(r".*Solvency Score.*", llm_json(900, "looks fine"))
+    env.vm.sender = env.rando
+    env.c.resolve_dispute(bob)
+
+    s = env.c.get_score(bob)
+    assert s["score"] == 100 and s["reasoning"] == "fraud"
+    assert env.c.get_claimable(carol) == 2 * BOND
+    env.assert_zero_wei([alice])
+
+
+def test_dispute_without_counter_url_uses_only_source_a(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    env.request(alice, bob, 900)
+    env.challenge(carol, bob)  # no counter-evidence
+    _web_by_url(env, {r".*": (200, "evaluator-says-rich")})
+    env.vm.mock_llm(r"(?s).*Source B \(challenger's counter-evidence\):.*", llm_json(0, "should not see source B"))
+    env.vm.mock_llm(r".*Solvency Score.*", llm_json(880, "fine"))
+    env.vm.sender = env.rando
+    env.c.resolve_dispute(bob)
+    assert env.c.get_score(bob)["score"] == 900     # upheld
+    assert env.c.get_claimable(carol) == 0
+
+
+def test_unreachable_counter_url_does_not_slash_evaluator(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    env.request(alice, bob, 900)
+    env.challenge(carol, bob, counter_url=COUNTER)
+    _web_by_url(env, {
+        r"data\.example\.com": (200, "evaluator-says-rich"),
+        r"counter\.example\.com": (404, "gone"),
+    })
+    env.vm.mock_llm(r".*Solvency Score.*", llm_json(880, "fine"))
+    env.vm.sender = env.rando
+    env.c.resolve_dispute(bob)                      # resolves normally on Source A alone
+    assert env.c.get_score(bob)["score"] == 900
+    assert env.c.get_stake(alice) == 200 * GEN
+    assert env.c.get_treasury() == BOND             # failed challenge forfeits the bond
+    env.assert_zero_wei([alice])
+
+
+# ======================================================================
+# evidence unavailable: 404/410 slash, transient errors revert  [#3, trap]
+# ======================================================================
+
+@pytest.mark.parametrize("status,body", [(404, "nope"), (410, "gone"), (200, "")])
 def test_missing_evidence_slashes_evaluator(env, alice, bob, carol, status, body):
     stake = 200 * GEN
     env.stake(alice, stake)
     env.request(alice, bob, 900)
     env.challenge(carol, bob)
 
-    env.mock_web_status(status, body)  # evaluator pulled / broke the URL
+    env.mock_web_status(status, body)
     env.vm.sender = env.rando
     env.c.resolve_dispute(bob)         # must NOT revert / get stuck
 
@@ -458,24 +567,63 @@ def test_missing_evidence_slashes_evaluator(env, alice, bob, carol, status, body
     env.assert_zero_wei([alice])
 
 
-def test_unreachable_evidence_slashes_evaluator(env, alice, bob, carol):
-    """No web response at all (network failure) is also the evaluator's fault."""
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504, 403, 401])
+def test_transient_http_error_reverts_without_slashing(env, alice, bob, carol, status):
+    stake = 200 * GEN
+    env.stake(alice, stake)
+    env.request(alice, bob, 900)
+    env.challenge(carol, bob)
+    env.mock_web_status(status)
+    env.vm.sender = env.rando
+    with env.vm.expect_revert("TRANSIENT"):
+        env.c.resolve_dispute(bob)
+    s = env.c.get_score(bob)
+    assert s["state"] == "DISPUTED" and s["score"] == 900     # untouched
+    assert env.c.get_stake(alice) == stake
+    assert env.c.get_accounting()["total_escrow"] == BOND     # bond still safely escrowed
+    assert env.c.get_claimable(carol) == 0
+    env.assert_zero_wei([alice])
+
+    env.resolve(bob, 880)                                     # challenger retries later: resolves
+    assert env.c.get_score(bob)["state"] == "FINAL"
+    env.assert_zero_wei([alice])
+
+
+def test_unreachable_network_is_transient_not_slashing(env, alice, bob, carol):
     env.stake(alice, 200 * GEN)
     env.request(alice, bob, 900)
     env.challenge(carol, bob)
-    env.vm.clear_mocks()  # nothing mocked -> fetch raises
+    env.vm.clear_mocks()  # nothing mocked -> the fetch itself raises
     env.vm.sender = env.rando
+    with env.vm.expect_revert("TRANSIENT"):
+        env.c.resolve_dispute(bob)
+    assert env.c.get_stake(alice) == 200 * GEN
+    assert env.c.get_score(bob)["state"] == "DISPUTED"
+
+
+def test_persistent_transient_failure_counts_after_timeout(env, alice, bob, carol):
+    """An evaluator cannot dodge a dispute by serving 503 forever."""
+    env.stake(alice, 200 * GEN)
+    env.request(alice, bob, 900)
+    env.challenge(carol, bob)
+    env.mock_web_status(503)
+    env.vm.sender = env.rando
+    env.warp(timedelta(days=7) - EPS)
+    with env.vm.expect_revert("TRANSIENT"):
+        env.c.resolve_dispute(bob)
+    env.warp(timedelta(days=7))
     env.c.resolve_dispute(bob)
-    assert env.c.get_score(bob)["score"] == 0
+    s = env.c.get_score(bob)
+    assert s["score"] == 0 and s["state"] == "FINAL"
     assert env.c.get_claimable(carol) == 2 * BOND
     env.assert_zero_wei([alice])
 
 
 def test_missing_evidence_with_unbonded_stake_still_slashes(env, alice, bob, carol):
     env.stake(alice, 200 * GEN)
-    env.request(alice, bob, 100)                 # exposure 20
+    env.request(alice, bob, 100)                 # capacity 20
     env.vm.sender = alice
-    env.c.initiate_unstake(180 * GEN)            # PENDING: allowed; leaves exactly the exposure
+    env.c.initiate_unstake(180 * GEN)            # leaves exactly the exposure
     env.challenge(carol, bob)
     env.mock_web_status(404)
     env.vm.sender = env.rando
@@ -486,21 +634,61 @@ def test_missing_evidence_with_unbonded_stake_still_slashes(env, alice, bob, car
 
 
 # ======================================================================
-# access control & payout  [fix 1 & 2]
+# validator consensus on leader errors  [#2]
 # ======================================================================
 
-def test_random_user_cannot_report_default(env, alice, bob, carol, dave):
+def _captured_validator(env, alice, bob):
+    """Run a successful analysis so a validator closure is captured."""
     env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 800)
-    for attacker in (env.rando, carol, dave, bob, alice):
-        env.vm.sender = attacker
-        with env.vm.expect_revert("Only whitelisted lender"):
-            env.c.report_default(bob, 1)
-    assert env.c.get_stake(alice) == 200 * GEN
-    assert env.c.get_score(bob)["score"] == 800
-    assert env.transfers == []
-    env.assert_zero_wei([alice])
+    env.request(alice, bob, 500)
 
+
+def _validate_leader_error(env, message, validator_sees):
+    """validator_sees: HTTP status int, 'ok' (200 + good LLM) or 'network' (fetch raises)."""
+    if validator_sees == "ok":
+        env.mock_score(500)
+    elif validator_sees == "network":
+        env.vm.clear_mocks()
+    else:
+        env.mock_web_status(validator_sees)
+    return env.vm.run_validator(leader_error=Exception(message))
+
+
+@pytest.mark.parametrize("seen,agrees", [
+    (404, True), (410, True), ("ok", False), (503, False), ("network", False),
+])
+def test_validator_agrees_on_data_unavailable_only_if_it_sees_it_too(env, alice, bob, seen, agrees):
+    _captured_validator(env, alice, bob)
+    assert _validate_leader_error(env, DATA_ERR, seen) is agrees
+
+
+@pytest.mark.parametrize("seen,agrees", [
+    (503, True), (429, True), (500, True), ("network", True), (404, False), ("ok", False),
+])
+def test_validator_agrees_on_transient_error_only_if_it_sees_it_too(env, alice, bob, seen, agrees):
+    _captured_validator(env, alice, bob)
+    assert _validate_leader_error(env, TRANSIENT_ERR, seen) is agrees
+
+
+@pytest.mark.parametrize("message", ["[LLM_ERROR] Missing 'score'", "[EXPECTED] whatever", "boom", ""])
+@pytest.mark.parametrize("seen", [404, 503, "ok"])
+def test_validator_rejects_unclassified_leader_errors(env, alice, bob, message, seen):
+    _captured_validator(env, alice, bob)
+    assert _validate_leader_error(env, message, seen) is False
+
+
+def test_validator_score_tolerance(env, alice, bob):
+    _captured_validator(env, alice, bob)
+    env.mock_score(600)
+    assert env.vm.run_validator(leader_result={"score": 500, "reasoning": "r"}) is True   # diff 100
+    assert env.vm.run_validator(leader_result={"score": 499, "reasoning": "r"}) is False  # diff 101
+    env.mock_web_status(404)
+    assert env.vm.run_validator(leader_result={"score": 600, "reasoning": "r"}) is False   # validator errors
+
+
+# ======================================================================
+# lender whitelist & loan registry  [#1, #7, #8]
+# ======================================================================
 
 def test_whitelist_is_governor_only(env, carol):
     env.vm.sender = carol
@@ -512,179 +700,458 @@ def test_whitelist_is_governor_only(env, carol):
     assert env.c.is_lender(env.lender)
 
 
-def test_removed_lender_loses_access(env, alice, bob):
+def test_governor_cannot_whitelist_itself(env):
+    env.vm.sender = env.governor
+    with env.vm.expect_revert("Governor cannot be a lender"):
+        env.c.whitelist_lender(env.governor)
+    assert not env.c.is_lender(env.governor)
+
+
+def test_governor_cannot_record_loan_or_default_without_being_a_lender(env, alice, bob):
     env.stake(alice, 200 * GEN)
     _finalize(env, alice, bob, 800)
+    env.vm.sender = env.governor
+    with env.vm.expect_revert("Only whitelisted lender"):
+        env.c.record_loan(bob, 10 * GEN)
+    with env.vm.expect_revert("No open loan"):
+        env.c.report_default(bob)
+    assert env.c.get_stake(alice) == 200 * GEN
+    assert env.transfers == []
+
+
+def test_record_loan_requires_whitelisted_lender(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    _finalize(env, alice, bob, 800)
+    for attacker in (env.rando, carol, bob, alice):
+        env.vm.sender = attacker
+        with env.vm.expect_revert("Only whitelisted lender"):
+            env.c.record_loan(bob, 1)
     env.vm.sender = env.governor
     env.c.remove_lender(env.lender)
     with env.vm.expect_revert("Only whitelisted lender"):
-        env.default(bob, 1)
+        env.record_loan(bob, 1)
 
 
-def test_distribute_treasury_removed(env):
-    assert not hasattr(env.c, "distribute_treasury")
-    with pytest.raises(AttributeError):
-        env.c.distribute_treasury(env.lender, 1)
-
-
-def test_governor_cannot_touch_treasury(env, alice, bob, carol):
-    """Only path out of the treasury was removed: forfeited bonds stay put."""
-    env.stake(alice, 200 * GEN)
-    env.request(alice, bob, 900)
-    env.challenge(carol, bob)
-    env.resolve(bob, 880)  # upheld -> bond to treasury
-    assert env.c.get_treasury() == BOND
-    for name in ("distribute_treasury", "withdraw_treasury", "drain_treasury"):
-        assert not hasattr(env.c, name)
-    env.vm.sender = env.governor
-    with env.vm.expect_revert("Nothing to withdraw"):
-        env.c.withdraw()
-    assert env.c.get_treasury() == BOND
-    env.assert_zero_wei([alice])
-
-
-@pytest.mark.parametrize("loss", [1, 37 * GEN, 160 * GEN, 10_000 * GEN])
-def test_default_pays_lender_directly_capped_by_borrow_power(env, alice, bob, loss):
-    stake = 200 * GEN
-    env.stake(alice, stake)
-    _finalize(env, alice, bob, 800)        # exposure = 160 GEN
-    assert env.c.get_max_borrow_power(bob) == 160 * GEN
-    env.default(bob, loss)
-    paid = min(loss, 160 * GEN)
-    assert env.transfers == [(env.lender, paid)]    # direct transfer, no claim step
-    assert env.c.get_stake(alice) == stake - paid
-    assert env.c.get_treasury() == 0                # slashes go to the lender, not treasury
-    assert env.c.get_claimable(env.lender) == 0
-    s = env.c.get_score(bob)
-    assert s["score"] == 0 and s["exposure"] == 0
-    assert env.c.get_exposure(alice) == 0
-    env.assert_zero_wei([alice])
-    with env.vm.expect_revert("Default already recorded"):
-        env.default(bob, 1)
-
-
-def test_default_rejections(env, alice, bob, carol):
+def test_record_loan_rejections(env, alice, bob):
     env.stake(alice, 200 * GEN)
     env.request(alice, bob, 800)
-    with env.vm.expect_revert("not FINAL"):         # PENDING
-        env.default(bob, 10)
-    env.challenge(carol, bob)
-    with env.vm.expect_revert("not FINAL"):         # DISPUTED
-        env.default(bob, 10)
+    with env.vm.expect_revert("exceeds borrow power"):   # PENDING: no power yet
+        env.record_loan(bob, 1)
+    env.advance(timedelta(hours=25))
+    env.finalize(bob)
+    with env.vm.expect_revert("Amount must be positive"):
+        env.record_loan(bob, 0)
+    with env.vm.expect_revert("exceeds borrow power"):
+        env.record_loan(bob, 160 * GEN + 1)
     with env.vm.expect_revert("No score for borrower"):
-        env.default(carol, 10)
-    env.resolve(bob, 800)
-    with env.vm.expect_revert("Loss must be positive"):
-        env.default(bob, 0)
-    env.assert_zero_wei([alice])
-
-
-def test_lender_cannot_be_evaluator_or_borrower(env, alice, bob):
-    env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 800)
+        env.record_loan(alice, 1)
     env.vm.sender = env.governor
     env.c.whitelist_lender(alice)
     env.c.whitelist_lender(bob)
     with env.vm.expect_revert("cannot be evaluator or borrower"):
-        env.default(bob, 10, lender=alice)
+        env.record_loan(bob, 1, lender=alice)
     with env.vm.expect_revert("cannot be evaluator or borrower"):
-        env.default(bob, 10, lender=bob)
-    assert env.c.get_stake(alice) == 200 * GEN
+        env.record_loan(bob, 1, lender=bob)
     env.assert_zero_wei([alice])
 
 
-def test_default_after_expiry_reverts(env, alice, bob):
+def test_record_loan_pins_capacity(env, alice, bob):
+    env.stake(alice, 200 * GEN)
+    _finalize(env, alice, bob, 800)                       # capacity 160
+    assert env.c.get_max_borrow_power(bob) == 160 * GEN
+    env.record_loan(bob, 100 * GEN)
+    s = env.c.get_score(bob)
+    assert s["exposure"] == 60 * GEN and s["loaned"] == 100 * GEN
+    assert env.c.get_exposure(alice) == 160 * GEN         # total commitment unchanged
+    assert env.c.get_loan_exposure(alice) == 100 * GEN
+    assert env.c.get_max_borrow_power(bob) == 60 * GEN
+    loan = env.c.get_loan(bob, env.lender)
+    assert loan["amount"] == 100 * GEN and loan["evaluator"] == alice.as_hex
+    env.record_loan(bob, 60 * GEN, lender=env.lender2)
+    assert env.c.get_max_borrow_power(bob) == 0
+    with env.vm.expect_revert("exceeds borrow power"):
+        env.record_loan(bob, 1)
+    env.assert_exposure_invariant([alice], [bob])
+    env.assert_zero_wei([alice])
+
+
+def test_same_lender_topup_accumulates(env, alice, bob):
+    env.stake(alice, 200 * GEN)
+    _finalize(env, alice, bob, 800)
+    env.record_loan(bob, 40 * GEN)
+    env.record_loan(bob, 30 * GEN)
+    assert env.c.get_loan(bob, env.lender)["amount"] == 70 * GEN
+    env.assert_exposure_invariant([alice], [bob])
+
+
+def test_default_settles_only_callers_loan(env, alice, bob):
+    """Single-lender wipeout fix: other lenders' loans stay intact and collectable."""
+    stake = 200 * GEN
+    env.stake(alice, stake)
+    _finalize(env, alice, bob, 800)                       # capacity 160
+    env.record_loan(bob, 100 * GEN)                       # lender 1
+    env.record_loan(bob, 60 * GEN, lender=env.lender2)    # lender 2
+
+    env.default(bob)                                      # lender 1 defaults first
+    assert env.transfers == [(env.lender, 100 * GEN)]
+    assert env.c.get_stake(alice) == stake - 100 * GEN
+    assert env.c.get_loan(bob, env.lender)["amount"] == 0
+    assert env.c.get_loan(bob, env.lender2)["amount"] == 60 * GEN        # untouched
+    assert env.c.get_loan_exposure(alice) == 60 * GEN
+    assert env.c.get_exposure(alice) == 60 * GEN                          # 100 released
+    assert env.c.get_score(bob)["score"] == 0                             # no new borrowing
+    assert env.c.get_max_borrow_power(bob) == 0
+    env.assert_exposure_invariant([alice], [bob])
+    env.assert_zero_wei([alice])
+
+    env.default(bob, lender=env.lender2)                  # lender 2 still collects in full
+    assert env.transfers[-1] == (env.lender2, 60 * GEN)
+    assert env.c.get_stake(alice) == stake - 160 * GEN
+    assert env.c.get_exposure(alice) == 0
+    env.assert_exposure_invariant([alice], [bob])
+    env.assert_zero_wei([alice])
+
+
+def test_default_requires_an_open_loan(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    _lend(env, alice, bob, 800, 50 * GEN)
+    for attacker in (env.rando, carol, bob, alice, env.governor, env.lender2):   # lender2 has no loan
+        env.vm.sender = attacker
+        with env.vm.expect_revert("No open loan"):
+            env.c.report_default(bob)
+    with env.vm.expect_revert("No open loan"):
+        env.c.report_default(carol)      # borrower with no score/loans at all
+    assert env.c.get_stake(alice) == 200 * GEN
+    assert env.transfers == []
+    env.assert_zero_wei([alice])
+
+
+def test_cannot_default_twice(env, alice, bob):
+    env.stake(alice, 200 * GEN)
+    _lend(env, alice, bob, 800, 50 * GEN)
+    env.default(bob)
+    with env.vm.expect_revert("No open loan"):
+        env.default(bob)
+    assert env.transfers == [(env.lender, 50 * GEN)]
+    env.assert_zero_wei([alice])
+
+
+def test_default_cannot_exceed_recorded_amount(env, alice, bob):
+    env.stake(alice, 200 * GEN)
+    _lend(env, alice, bob, 800, 25 * GEN)
+    env.default(bob)
+    assert env.transfers == [(env.lender, 25 * GEN)]      # exactly the recorded loan
+    assert env.c.get_stake(alice) == 175 * GEN
+
+
+def test_closed_loan_cannot_default(env, alice, bob):
+    env.stake(alice, 200 * GEN)
+    _lend(env, alice, bob, 800, 100 * GEN)
+    env.vm.sender = env.rando
+    with env.vm.expect_revert("No open loan"):
+        env.c.close_loan(bob)                             # only the lender can close its own
+    env.close_loan(bob)
+    assert env.c.get_loan_exposure(alice) == 0
+    assert env.c.get_exposure(alice) == 60 * GEN          # capacity left, loan released
+    with env.vm.expect_revert("No open loan"):
+        env.default(bob)
+    env.assert_exposure_invariant([alice], [bob])
+    env.assert_zero_wei([alice])
+
+
+def test_loan_on_other_evaluator_requires_closing_first(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    env.stake(bob, 200 * GEN)
+    _lend(env, alice, carol, 800, 160 * GEN)              # capacity fully lent -> power 0
+    assert env.c.get_max_borrow_power(carol) == 0
+    env.request(bob, carol, 700)                          # any evaluator may replace [#5]
+    env.advance(timedelta(hours=25))
+    env.finalize(carol)
+    with env.vm.expect_revert("Close the existing loan first"):
+        env.record_loan(carol, 10 * GEN)
+    assert env.c.get_loan(carol, env.lender)["evaluator"] == alice.as_hex
+    env.record_loan(carol, 10 * GEN, lender=env.lender2)  # a different lender is fine
+    assert env.c.get_loan(carol, env.lender2)["evaluator"] == bob.as_hex
+    env.assert_exposure_invariant([alice, bob], [carol])
+
+
+# -- loans outlive the score  [#8] ---------------------------------------
+
+def test_loan_protection_outlives_score_expiry(env, alice, bob):
+    stake = 200 * GEN
+    env.stake(alice, stake)
+    _lend(env, alice, bob, 800, 100 * GEN)                # capacity 160 -> 60 + loan 100
+    env.warp(timedelta(days=90))                          # score long expired
+    assert env.c.get_max_borrow_power(bob) == 0
+    env.vm.sender = env.rando
+    env.c.release_expired(bob)                            # frees unlent capacity only
+    assert env.c.get_score(bob)["exposure"] == 0
+    assert env.c.get_exposure(alice) == 100 * GEN         # the loan is still pinned
+    env.vm.sender = alice
+    with env.vm.expect_revert("below exposure"):
+        env.c.initiate_unstake(101 * GEN)                 # cannot walk away from the loan
+    env.default(bob)                                      # day 90: still collectable
+    assert env.transfers == [(env.lender, 100 * GEN)]
+    assert env.c.get_stake(alice) == stake - 100 * GEN
+    env.assert_exposure_invariant([alice], [bob])
+    env.assert_zero_wei([alice])
+
+
+def test_loan_protection_ends_after_loan_ttl(env, alice, bob):
+    env.stake(alice, 200 * GEN)
+    _lend(env, alice, bob, 800, 100 * GEN)
+    created = env.c.get_loan(bob, env.lender)["created"]
+    env.warp(timedelta(hours=25) + LOAN_TTL)              # exactly created + TTL: still protected
+    assert env.t.timestamp() == created + int(LOAN_TTL.total_seconds())
+    env.vm.sender = env.rando
+    with env.vm.expect_revert("Loan has not expired"):
+        env.c.expire_loan(bob, env.lender)
+    env.warp(timedelta(hours=25) + LOAN_TTL + EPS)
+    env.vm.sender = env.lender
+    with env.vm.expect_revert("Loan protection expired"):
+        env.c.report_default(bob)
+    env.vm.sender = env.rando
+    env.c.expire_loan(bob, env.lender)                    # anyone frees the stuck stake
+    assert env.c.get_loan_exposure(alice) == 0
+    with env.vm.expect_revert("No open loan"):
+        env.c.expire_loan(bob, env.lender)
+    env.assert_exposure_invariant([alice], [bob])
+    env.assert_zero_wei([alice])
+
+
+def test_loan_on_expired_score_is_rejected(env, alice, bob):
     env.stake(alice, 200 * GEN)
     _finalize(env, alice, bob, 800)
     env.warp(TTL + EPS)
-    with env.vm.expect_revert("Score expired"):
-        env.default(bob, 10)
-    env.assert_zero_wei([alice])
+    with env.vm.expect_revert("exceeds borrow power"):
+        env.record_loan(bob, 1)
 
 
-def test_default_slash_eats_unbonding(env, alice, bob, dave, carol):
-    """A dispute slash can leave active stake below exposure; the default then
-    reaches into the unbonding queue."""
-    env.stake(alice, 200 * GEN)
-    env.request(alice, bob, 500)                 # exposure 100
-    env.request(alice, dave, 100)                # exposure 20
-    env.vm.sender = alice
-    env.c.initiate_unstake(80 * GEN)             # leaves 120 == exposure 120
-    env.challenge(carol, dave)
-    env.resolve(dave, 700)                       # overturned: slash 50 + reward 5 from active
-    assert env.c.get_stake(alice) == 65 * GEN
-    assert env.c.get_exposure(alice) == 120 * GEN    # commitment is NOT shrunk by the slash
+# -- under-collateralization after a dispute slash  [#6] ------------------
+
+def test_payouts_capped_first_come_first_served_after_dispute_slash(env, alice, bob, dave, carol):
+    env.stake(alice, MIN_STAKE)                           # 100
+    env.request(alice, bob, 500)                          # capacity 50
     env.advance(timedelta(hours=25))
     env.finalize(bob)
-    env.default(bob, 10_000 * GEN)               # claim 100: 65 active + 35 unbonding
-    assert env.transfers == [(env.lender, 100 * GEN)]
+    env.record_loan(bob, 30 * GEN)                        # lender 1
+    env.record_loan(bob, 20 * GEN, lender=env.lender2)    # lender 2
+    env.request(alice, dave, 100)                         # capacity 10: committed 60 <= 100
+    env.challenge(carol, dave)
+    env.resolve(dave, 700)                                # overturned: slash 50 + reward 5
+    assert env.c.get_stake(alice) == 45 * GEN             # < exposure (loans 50 + dave's 10)
+    assert env.c.get_exposure(alice) > env.c.get_stake(alice)
+
+    env.default(bob)                                      # first: paid in full
+    assert env.transfers[-1] == (env.lender, 30 * GEN)
+    assert env.c.get_stake(alice) == 15 * GEN
+    env.default(bob, lender=env.lender2)                  # second: only what is left
+    assert env.transfers[-1] == (env.lender2, 15 * GEN)
     assert env.c.get_stake(alice) == 0
-    assert env.c.get_unbonding(alice)["amount"] == 45 * GEN
-    env.assert_zero_wei([alice])
-    env.warp(timedelta(days=9))
-    env.vm.sender = alice
-    assert env.c.claim_unstaked() == 45 * GEN    # only what survived
+    assert env.c.get_loan_exposure(alice) == 0            # both fully released regardless
+    env.assert_exposure_invariant([alice], [bob, dave])
     env.assert_zero_wei([alice])
 
 
-def test_default_within_active_leaves_unbonding_intact(env, alice, bob):
-    env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 800)              # exposure 160
-    env.vm.sender = alice
-    env.c.initiate_unstake(40 * GEN)
-    env.default(bob, 30 * GEN)
-    assert env.c.get_stake(alice) == 130 * GEN
-    assert env.c.get_unbonding(alice)["amount"] == 40 * GEN
-    env.assert_zero_wei([alice])
-
-
-def test_default_capped_by_exposure(env, alice, bob):
-    env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 800)              # exposure 160
-    env.vm.sender = alice
-    env.c.initiate_unstake(40 * GEN)             # free stake only
-    env.default(bob, 10_000 * GEN)               # claim capped at exposure 160
-    assert env.c.get_stake(alice) == 0
-    assert env.c.get_unbonding(alice)["amount"] == 40 * GEN
-    assert env.transfers == [(env.lender, 160 * GEN)]
-    env.assert_zero_wei([alice])
-
-
-def test_default_payout_capped_by_what_is_left(env, alice, bob, dave, carol):
-    """A dispute slash leaves less stake than the exposure: the lender gets what exists."""
+def test_default_can_take_the_entire_stake_and_evaluator_can_restake(env, alice, bob):
     env.stake(alice, MIN_STAKE)
-    env.request(alice, bob, 500)                 # exposure 50
-    env.request(alice, dave, 100)                # exposure 10
-    env.challenge(carol, dave)
-    env.resolve(dave, 700)                       # slash 50 + reward 5 -> active 45
-    assert env.c.get_stake(alice) == 45 * GEN
-    env.advance(timedelta(hours=25))
-    env.finalize(bob)
-    env.default(bob, 10_000 * GEN)
-    assert env.transfers == [(env.lender, 45 * GEN)]   # < exposure 50
+    _lend(env, alice, bob, 1000, 100 * GEN)
+    env.default(bob)                                      # takes the whole 100
     assert env.c.get_stake(alice) == 0
+    env.stake(alice, MIN_STAKE)
+    env.request(alice, env.many[0], 1000)
+    assert env.c.get_exposure(alice) == 100 * GEN
     env.assert_zero_wei([alice])
+
+
+# -- treasury claim route  [#8] -----------------------------------------
+
+def _fund_treasury(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    env.request(alice, bob, 900)
+    env.challenge(carol, bob)
+    env.resolve(bob, 880)                                 # upheld -> bond to treasury
+    assert env.c.get_treasury() == BOND
+
+
+def test_claim_treasury(env, alice, bob, carol):
+    _fund_treasury(env, alice, bob, carol)
+    env.vm.sender = env.governor
+    env.c.claim_treasury(3 * GEN, env.many[0])
+    assert env.c.get_treasury() == 2 * GEN
+    assert env.transfers == [(env.many[0], 3 * GEN)]
+    env.assert_zero_wei([alice])
+    env.c.claim_treasury(2 * GEN, env.many[0])
+    assert env.c.get_treasury() == 0
+    env.assert_zero_wei([alice])
+
+
+def test_claim_treasury_rejections(env, alice, bob, carol):
+    _fund_treasury(env, alice, bob, carol)
+    from genlayer import Address
+
+    for attacker in (env.rando, carol, env.lender):
+        env.vm.sender = attacker
+        with env.vm.expect_revert("Only governor"):
+            env.c.claim_treasury(1, attacker)
+    env.vm.sender = env.governor
+    with env.vm.expect_revert("Invalid amount"):
+        env.c.claim_treasury(0, env.many[0])
+    with env.vm.expect_revert("Invalid amount"):
+        env.c.claim_treasury(BOND + 1, env.many[0])
+    with env.vm.expect_revert("Invalid destination"):
+        env.c.claim_treasury(1, env.governor)             # no self-payout
+    with env.vm.expect_revert("Invalid destination"):
+        env.c.claim_treasury(1, Address(b"\x00" * 20))
+    assert env.c.get_treasury() == BOND
+    assert env.transfers == []
+    env.assert_zero_wei([alice])
+
+
+def test_claim_treasury_cannot_touch_stake_or_default_proceeds(env, alice, bob, carol):
+    _fund_treasury(env, alice, bob, carol)
+    env.advance(timedelta(hours=25))
+    env.vm.sender = env.governor
+    with env.vm.expect_revert("Invalid amount"):
+        env.c.claim_treasury(BOND + 1, env.many[0])              # stake is not claimable
+    assert env.c.get_stake(alice) == 200 * GEN
 
 
 # ======================================================================
-# cumulative exposure  [fix 3]
+# replacement rules  [#5 and front-running]
+# ======================================================================
+
+def test_score_with_zero_power_is_replaceable_by_any_evaluator(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    env.stake(bob, 200 * GEN)
+    _finalize(env, alice, carol, 0)                       # zero score: no borrow power
+    assert env.c.get_max_borrow_power(carol) == 0
+    env.request(bob, carol, 600)                          # immediately, within the 30 days
+    s = env.c.get_score(carol)
+    assert s["evaluator"] == bob.as_hex and s["score"] == 600
+    env.assert_exposure_invariant([alice, bob], [carol])
+    env.assert_zero_wei([alice, bob])
+
+
+def test_fully_lent_score_is_replaceable_but_loans_stay_pinned(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    env.stake(bob, 200 * GEN)
+    _lend(env, alice, carol, 800, 160 * GEN)              # whole capacity lent out
+    env.request(bob, carol, 100)                          # replaced right away
+    assert env.c.get_score(carol)["evaluator"] == bob.as_hex
+    assert env.c.get_loan_exposure(alice) == 160 * GEN    # alice's liability did not vanish
+    env.default(carol)
+    assert env.transfers == [(env.lender, 160 * GEN)]
+    assert env.c.get_stake(alice) == 40 * GEN
+    env.assert_zero_wei([alice, bob])
+
+
+def test_active_score_with_capacity_cannot_be_lowered_before_expiry(env, alice, bob):
+    env.stake(alice, 200 * GEN)
+    _finalize(env, alice, bob, 800)
+    for new_score in (0, 100, 900):
+        env.mock_score(new_score)
+        env.vm.sender = alice
+        with env.vm.expect_revert("cannot be replaced before expiry"):
+            env.c.request_score_update(bob, URL)
+    s = env.c.get_score(bob)
+    assert s["score"] == 800 and s["exposure"] == 160 * GEN
+    env.assert_zero_wei([alice])
+
+
+def test_score_replaceable_exactly_after_expiry(env, alice, bob):
+    env.stake(alice, 200 * GEN)
+    env.request(alice, bob, 800)
+    env.advance(timedelta(hours=25))
+    env.finalize(bob)
+    env.warp(TTL)
+    env.mock_score(0)
+    env.vm.sender = alice
+    with env.vm.expect_revert("cannot be replaced before expiry"):
+        env.c.request_score_update(bob, URL)
+    env.warp(TTL + EPS)
+    env.c.request_score_update(bob, URL)
+    assert env.c.get_score(bob)["score"] == 0
+    assert env.c.get_exposure(alice) == 0
+
+
+def test_other_evaluator_cannot_overwrite_active_score(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    env.stake(bob, 200 * GEN)
+    _finalize(env, alice, carol, 800)
+    env.mock_score(100)
+    env.vm.sender = bob
+    with env.vm.expect_revert("belongs to another evaluator"):
+        env.c.request_score_update(carol, URL)
+    s = env.c.get_score(carol)
+    assert s["evaluator"] == alice.as_hex and s["score"] == 800
+    assert env.c.get_exposure(alice) == 160 * GEN
+    assert env.c.get_exposure(bob) == 0
+    env.assert_zero_wei([alice, bob])
+
+
+def test_cannot_overwrite_pending_or_disputed(env, alice, bob, carol, dave):
+    env.stake(alice, 200 * GEN)
+    env.stake(bob, 200 * GEN)
+    env.request(alice, carol, 800)
+    env.mock_score(100)
+    for who in (bob, alice):
+        env.vm.sender = who
+        with env.vm.expect_revert("still in challenge process"):
+            env.c.request_score_update(carol, URL)
+    env.challenge(dave, carol)
+    for who in (bob, alice):
+        env.vm.sender = who
+        with env.vm.expect_revert("Score is disputed"):
+            env.c.request_score_update(carol, URL)
+    assert env.c.get_score(carol)["evaluator"] == alice.as_hex
+    env.assert_zero_wei([alice, bob])
+
+
+def test_overwrite_allowed_after_expiry_and_frees_old_exposure(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    env.stake(bob, 200 * GEN)
+    _finalize(env, alice, carol, 800)
+    env.warp(TTL + timedelta(hours=1))
+    env.request(bob, carol, 600)
+    s = env.c.get_score(carol)
+    assert s["evaluator"] == bob.as_hex and s["state"] == "PENDING"
+    assert env.c.get_exposure(alice) == 0
+    assert env.c.get_exposure(bob) == 120 * GEN
+    env.assert_exposure_invariant([alice, bob], [carol])
+    env.assert_zero_wei([alice, bob])
+
+
+def test_replaced_after_expiry_frees_old_exposure(env, alice, bob):
+    env.stake(alice, MIN_STAKE)
+    _finalize(env, alice, bob, 1000)
+    assert env.c.get_exposure(alice) == 100 * GEN
+    env.warp(TTL + timedelta(hours=1))
+    env.request(alice, bob, 300)
+    assert env.c.get_exposure(alice) == 30 * GEN
+    assert env.c.get_score(bob)["state"] == "PENDING"
+    env.assert_exposure_invariant([alice], [bob])
+
+
+# ======================================================================
+# cumulative exposure
 # ======================================================================
 
 def test_exposure_cannot_exceed_stake(env, alice):
     b = env.many
-    env.stake(alice, MIN_STAKE)                 # 100 GEN
-    env.request(alice, b[0], 600)               # 60
+    env.stake(alice, MIN_STAKE)
+    env.request(alice, b[0], 600)
     assert env.c.get_exposure(alice) == 60 * GEN
     env.mock_score(500)
     env.vm.sender = alice
-    with env.vm.expect_revert("Exposure exceeds stake"):  # 60 + 50 = 110 > 100
+    with env.vm.expect_revert("Exposure exceeds stake"):
         env.c.request_score_update(b[1], URL)
     assert env.c.get_exposure(alice) == 60 * GEN
-    env.request(alice, b[1], 400)               # 60 + 40 = 100 == stake: allowed
+    env.request(alice, b[1], 400)
     assert env.c.get_exposure(alice) == 100 * GEN
     env.mock_score(1)
     env.vm.sender = alice
-    with env.vm.expect_revert("Exposure exceeds stake"):  # 1/1000 of 100 GEN > 0 left
+    with env.vm.expect_revert("Exposure exceeds stake"):
         env.c.request_score_update(b[2], URL)
     env.assert_exposure_invariant([alice], b)
     env.assert_zero_wei([alice])
@@ -702,14 +1169,23 @@ def test_five_borrowers_cannot_leverage_100_gen_into_500(env, alice):
             ok += 1
         except Exception as ex:
             assert "Exposure exceeds stake" in str(ex)
-    assert ok == 3  # 3 x 30 GEN = 90; the 4th would reach 120 > 100
-    total_power = 0
-    for borrower in b[:5]:
-        try:
-            total_power += env.c.get_score(borrower)["exposure"]
-        except Exception:
-            pass
-    assert total_power <= 100 * GEN
+    assert ok == 3
+    assert env.c.get_exposure(alice) <= 100 * GEN
+    env.assert_exposure_invariant([alice], b)
+
+
+def test_exposure_counts_open_loans(env, alice):
+    b = env.many
+    env.stake(alice, MIN_STAKE)
+    _lend(env, alice, b[0], 1000, 100 * GEN)              # whole stake lent
+    env.request(alice, b[1], 0)                           # zero scores add nothing
+    env.mock_score(1)
+    env.vm.sender = alice
+    with env.vm.expect_revert("Exposure exceeds stake"):
+        env.c.request_score_update(b[2], URL)
+    env.close_loan(b[0])                                  # loan repaid: capacity for others
+    env.request(alice, b[2], 500)
+    assert env.c.get_exposure(alice) == 50 * GEN
     env.assert_exposure_invariant([alice], b)
 
 
@@ -717,43 +1193,31 @@ def test_exposure_is_per_evaluator(env, alice, bob):
     b = env.many
     env.stake(alice, MIN_STAKE)
     env.stake(bob, MIN_STAKE)
-    env.request(alice, b[0], 1000)   # alice fully utilised (100)
-    env.request(bob, b[1], 1000)     # bob independent
+    env.request(alice, b[0], 1000)
+    env.request(bob, b[1], 1000)
     assert env.c.get_exposure(alice) == 100 * GEN
     assert env.c.get_exposure(bob) == 100 * GEN
     env.assert_exposure_invariant([alice, bob], b)
 
 
-def test_replaced_after_expiry_frees_old_exposure(env, alice, bob):
-    env.stake(alice, MIN_STAKE)
-    _finalize(env, alice, bob, 1000)             # full 100
-    assert env.c.get_exposure(alice) == 100 * GEN
-    env.warp(TTL + timedelta(hours=1))
-    env.request(alice, bob, 300)                 # expired: replace, 100 freed, 30 taken
-    assert env.c.get_exposure(alice) == 30 * GEN
-    assert env.c.get_score(bob)["state"] == "PENDING"
-    env.assert_exposure_invariant([alice], [bob])
-
-
 def test_expired_exposure_can_be_released_and_reused(env, alice):
     b = env.many
     env.stake(alice, MIN_STAKE)
-    _finalize(env, alice, b[0], 1000)            # uses everything
+    _finalize(env, alice, b[0], 1000)
     env.mock_score(500)
     env.vm.sender = alice
     with env.vm.expect_revert("Exposure exceeds stake"):
         env.c.request_score_update(b[1], URL)
-
     env.vm.sender = env.rando
     with env.vm.expect_revert("has not expired"):
         env.c.release_expired(b[0])
-    env.warp(TTL)                                 # exactly 30d: not yet expired
+    env.warp(TTL)
     with env.vm.expect_revert("has not expired"):
         env.c.release_expired(b[0])
     env.warp(TTL + timedelta(hours=1))
     env.c.release_expired(b[0])
     assert env.c.get_exposure(alice) == 0
-    env.c.release_expired(b[0])                   # idempotent
+    env.c.release_expired(b[0])
     env.request(alice, b[1], 500)
     assert env.c.get_exposure(alice) == 50 * GEN
     env.assert_exposure_invariant([alice], b)
@@ -773,35 +1237,36 @@ def test_release_expired_rejects_disputed(env, alice, bob, carol):
 
 def test_overturn_does_not_grow_exposure(env, alice, bob, carol):
     env.stake(alice, 300 * GEN)
-    env.request(alice, bob, 400)                  # exposure 120
+    env.request(alice, bob, 400)
     env.challenge(carol, bob)
-    env.resolve(bob, 900)                         # overturned *upward*
+    env.resolve(bob, 900)
     s = env.c.get_score(bob)
     assert s["score"] == 900
-    assert s["exposure"] <= 120 * GEN             # never grows past the checked commitment
+    assert s["exposure"] <= 120 * GEN
     assert env.c.get_exposure(alice) == s["exposure"]
     env.assert_zero_wei([alice])
 
 
-def test_default_frees_exposure(env, alice, bob):
+def test_default_frees_exposure_and_blocks_new_loans(env, alice, bob):
     env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 500)
+    _lend(env, alice, bob, 500, 40 * GEN)                 # capacity 100: 60 + loan 40
     assert env.c.get_exposure(alice) == 100 * GEN
-    env.default(bob, 10 * GEN)
+    env.default(bob)
     assert env.c.get_exposure(alice) == 0
+    with env.vm.expect_revert("exceeds borrow power"):
+        env.record_loan(bob, 1, lender=env.lender2)       # defaulted borrower: no more credit
     env.assert_exposure_invariant([alice], [bob])
 
 
 # ======================================================================
-# premature borrowing & expiration  [fix 4]
+# premature borrowing & expiration
 # ======================================================================
 
 def test_pending_score_has_zero_borrow_power(env, alice, bob):
     env.stake(alice, 200 * GEN)
     env.request(alice, bob, 800)
-    assert env.c.get_score(bob)["state"] == "PENDING"
     assert env.c.get_max_borrow_power(bob) == 0
-    env.warp(timedelta(hours=24))                 # window over but not finalized
+    env.warp(timedelta(hours=24))
     assert env.c.get_max_borrow_power(bob) == 0
     env.finalize(bob)
     assert env.c.get_max_borrow_power(bob) == 160 * GEN
@@ -818,29 +1283,29 @@ def test_disputed_score_has_zero_borrow_power(env, alice, bob, carol):
 
 def test_borrow_power_expires_after_30_days(env, alice, bob):
     env.stake(alice, 200 * GEN)
-    env.request(alice, bob, 800)                  # issued at T0
+    env.request(alice, bob, 800)
     env.warp(timedelta(hours=25))
     env.finalize(bob)
-    env.warp(TTL)                                 # exactly timestamp + 30d: still valid
+    env.warp(TTL)
     assert env.c.get_max_borrow_power(bob) == 160 * GEN
-    env.warp(TTL + EPS)                           # one second later: expired
+    env.warp(TTL + EPS)
     assert env.c.get_max_borrow_power(bob) == 0
 
 
 def test_borrow_power_math_and_dynamic_drop(env, alice, bob):
     assert env.c.get_max_borrow_power(bob) == 0
     env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 400)               # exposure 80
+    _finalize(env, alice, bob, 400)
     assert env.c.get_max_borrow_power(bob) == (400 * 200 * GEN) // 1000
     env.vm.sender = alice
-    env.c.initiate_unstake(100 * GEN)             # stake 100 >= exposure 80: allowed
-    assert env.c.get_max_borrow_power(bob) == (400 * 100 * GEN) // 1000   # 40 < committed 80
+    env.c.initiate_unstake(100 * GEN)
+    assert env.c.get_max_borrow_power(bob) == (400 * 100 * GEN) // 1000
 
 
 def test_topup_cannot_inflate_borrow_power(env, alice, bob):
     env.stake(alice, MIN_STAKE)
-    _finalize(env, alice, bob, 500)               # committed 50
-    env.stake(alice, 900 * GEN)                   # stake 1000: live power would be 500
+    _finalize(env, alice, bob, 500)
+    env.stake(alice, 900 * GEN)
     assert env.c.get_max_borrow_power(bob) == 50 * GEN
 
 
@@ -851,136 +1316,45 @@ def test_borrow_power_floor_division(env, alice, bob):
 
 
 # ======================================================================
-# state overwrite  [fix 7]
+# front-running gap: exposure evasion via unstake
 # ======================================================================
-
-def test_other_evaluator_cannot_overwrite_active_score(env, alice, bob, carol):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    _finalize(env, alice, carol, 800)             # FINAL, within 30d
-    env.mock_score(100)
-    env.vm.sender = bob
-    with env.vm.expect_revert("belongs to another evaluator"):
-        env.c.request_score_update(carol, URL)
-    s = env.c.get_score(carol)
-    assert s["evaluator"] == alice.as_hex and s["score"] == 800
-    assert env.c.get_exposure(alice) == 160 * GEN
-    assert env.c.get_exposure(bob) == 0
-    env.assert_zero_wei([alice, bob])
-
-
-def test_cannot_overwrite_pending_or_disputed(env, alice, bob, carol, dave):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    env.request(alice, carol, 800)                # PENDING
-    env.mock_score(100)
-    for who in (bob, alice):                      # not even the owner mid-challenge
-        env.vm.sender = who
-        with env.vm.expect_revert("still in challenge process"):
-            env.c.request_score_update(carol, URL)
-    env.challenge(dave, carol)                    # DISPUTED
-    for who in (bob, alice):
-        env.vm.sender = who
-        with env.vm.expect_revert("Score is disputed"):
-            env.c.request_score_update(carol, URL)
-    assert env.c.get_score(carol)["evaluator"] == alice.as_hex
-    env.assert_zero_wei([alice, bob])
-
-
-def test_overwrite_allowed_after_expiry_and_frees_old_exposure(env, alice, bob, carol):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    _finalize(env, alice, carol, 800)
-    env.warp(TTL + timedelta(hours=1))
-    env.request(bob, carol, 600)
-    s = env.c.get_score(carol)
-    assert s["evaluator"] == bob.as_hex and s["state"] == "PENDING"
-    assert env.c.get_exposure(alice) == 0         # old commitment released
-    assert env.c.get_exposure(bob) == 120 * GEN
-    env.assert_exposure_invariant([alice, bob], [carol])
-    env.assert_zero_wei([alice, bob])
-
-
-def test_same_evaluator_can_rescore_once_liability_is_settled(env, alice, carol):
-    env.stake(alice, 200 * GEN)
-    _finalize(env, alice, carol, 800)
-    env.default(carol, 10 * GEN)                 # liability settled: score 0, exposure 0
-    env.request(alice, carol, 700)
-    assert env.c.get_score(carol)["score"] == 700
-    assert env.c.get_exposure(alice) == 700 * 190 * GEN // 1000   # stake is 190 after the slash
-
-
-# ======================================================================
-# front-running gaps: score evasion & exposure evasion
-# ======================================================================
-
-def test_active_score_cannot_be_lowered_to_zero_before_expiry(env, alice, bob):
-    env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 800)              # lenders may now lend against 160 GEN
-    for new_score in (0, 100, 900):              # lowering OR raising: both blocked
-        env.mock_score(new_score)
-        env.vm.sender = alice
-        with env.vm.expect_revert("cannot be replaced before expiry"):
-            env.c.request_score_update(bob, URL)
-    s = env.c.get_score(bob)
-    assert s["score"] == 800 and s["state"] == "FINAL" and s["exposure"] == 160 * GEN
-    assert env.c.get_exposure(alice) == 160 * GEN
-    # liability intact: a lender can still collect
-    env.default(bob, 10_000 * GEN)
-    assert env.transfers == [(env.lender, 160 * GEN)]
-    env.assert_zero_wei([alice])
-
-
-def test_score_replaceable_exactly_after_expiry(env, alice, bob):
-    env.stake(alice, 200 * GEN)
-    env.request(alice, bob, 800)
-    env.advance(timedelta(hours=25))
-    env.finalize(bob)
-    env.warp(TTL)                                 # timestamp + 30d: still live
-    env.mock_score(0)
-    env.vm.sender = alice
-    with env.vm.expect_revert("cannot be replaced before expiry"):
-        env.c.request_score_update(bob, URL)
-    env.warp(TTL + EPS)
-    env.c.request_score_update(bob, URL)          # expired: allowed
-    assert env.c.get_score(bob)["score"] == 0
-    assert env.c.get_exposure(alice) == 0
-
-
-def test_score_without_liability_can_be_replaced(env, alice, bob):
-    env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 0)                 # exposure 0: nothing to evade
-    env.request(alice, bob, 500)
-    assert env.c.get_score(bob)["score"] == 500
-
 
 def test_cannot_unstake_below_exposure(env, alice, bob):
     env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 800)              # exposure 160 -> 40 GEN free
+    _finalize(env, alice, bob, 800)
     env.vm.sender = alice
     with env.vm.expect_revert("below exposure"):
         env.c.initiate_unstake(40 * GEN + 1)
     with env.vm.expect_revert("below exposure"):
         env.c.initiate_unstake(200 * GEN)
-    assert env.c.get_stake(alice) == 200 * GEN
-    assert env.c.get_unbonding(alice)["amount"] == 0
-    env.c.initiate_unstake(40 * GEN)             # exactly the free stake
-    assert env.c.get_stake(alice) == 160 * GEN
+    env.c.initiate_unstake(40 * GEN)
     with env.vm.expect_revert("below exposure"):
         env.c.initiate_unstake(1)
     env.assert_zero_wei([alice])
 
 
-def test_unstake_guard_counts_pending_and_all_scores(env, alice):
+def test_unstake_guard_counts_pending_scores_and_loans(env, alice):
     b = env.many
     env.stake(alice, 300 * GEN)
-    env.request(alice, b[0], 400)                # PENDING exposure 120
-    env.request(alice, b[1], 300)                # PENDING exposure 90
+    _lend(env, alice, b[0], 400, 100 * GEN)               # capacity 120: 20 + loan 100
+    env.request(alice, b[1], 300)                         # PENDING 90
     env.vm.sender = alice
     with env.vm.expect_revert("below exposure"):
-        env.c.initiate_unstake(91 * GEN)         # 300 - 91 = 209 < 210
+        env.c.initiate_unstake(91 * GEN)                  # 300 - 91 = 209 < 210
     env.c.initiate_unstake(90 * GEN)
     env.assert_exposure_invariant([alice], b)
+    env.assert_zero_wei([alice])
+
+
+def test_unstake_unlocks_after_loan_closed(env, alice, bob):
+    env.stake(alice, 200 * GEN)
+    _lend(env, alice, bob, 800, 100 * GEN)
+    env.vm.sender = alice
+    with env.vm.expect_revert("below exposure"):
+        env.c.initiate_unstake(41 * GEN)
+    env.close_loan(bob)                                   # exposure 60 left (capacity)
+    env.vm.sender = alice
+    env.c.initiate_unstake(140 * GEN)
     env.assert_zero_wei([alice])
 
 
@@ -994,17 +1368,7 @@ def test_unstake_unlocks_after_exposure_is_released(env, alice, bob):
     env.vm.sender = env.rando
     env.c.release_expired(bob)
     env.vm.sender = alice
-    env.c.initiate_unstake(200 * GEN)            # nothing backs live scores any more
-    assert env.c.get_stake(alice) == 0
-    env.assert_zero_wei([alice])
-
-
-def test_unstake_unlocks_after_default_settles_liability(env, alice, bob):
-    env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 800)
-    env.default(bob, 50 * GEN)                   # stake 150, exposure 0
-    env.vm.sender = alice
-    env.c.initiate_unstake(150 * GEN)
+    env.c.initiate_unstake(200 * GEN)
     assert env.c.get_stake(alice) == 0
     env.assert_zero_wei([alice])
 
@@ -1025,15 +1389,15 @@ def _claim_unstaked(env, who):
 
 def test_unstake_flow(env, alice, bob):
     env.stake(alice, 300 * GEN)
-    _finalize(env, alice, bob, 800)               # exposure 240; clock T0 + 25h
+    _finalize(env, alice, bob, 800)
     assert env.c.get_max_borrow_power(bob) == 800 * 300 * GEN // 1000
-    _unstake(env, alice, 60 * GEN)                # only the free 60 may leave
+    _unstake(env, alice, 60 * GEN)
     assert env.c.get_stake(alice) == 240 * GEN
     u = env.c.get_unbonding(alice)
     assert u["amount"] == 60 * GEN
     assert u["unlock_time"] == int((T0 + timedelta(hours=25) + WEEK).timestamp())
     assert env.c.get_claimable(alice) == 0
-    assert env.c.get_max_borrow_power(bob) == 800 * 240 * GEN // 1000   # live stake drops power
+    assert env.c.get_max_borrow_power(bob) == 800 * 240 * GEN // 1000
     env.assert_zero_wei([alice])
 
     env.vm.warp(iso(T0 + timedelta(hours=25) + WEEK - EPS))
@@ -1093,8 +1457,8 @@ def test_second_unstake_accumulates_and_restarts_timer(env, alice):
 
 def test_below_min_stake_blocks_new_scores_only(env, alice, bob, carol):
     env.stake(alice, 150 * GEN)
-    _finalize(env, alice, bob, 300)               # exposure 45
-    _unstake(env, alice, 51 * GEN)                # active 99 < min_stake, still >= exposure
+    _finalize(env, alice, bob, 300)
+    _unstake(env, alice, 51 * GEN)
     env.mock_score(500)
     env.vm.sender = alice
     with env.vm.expect_revert("not a staked evaluator"):
@@ -1104,13 +1468,49 @@ def test_below_min_stake_blocks_new_scores_only(env, alice, bob, carol):
     env.assert_zero_wei([alice])
 
 
+def test_default_slash_eats_unbonding(env, alice, bob, dave, carol):
+    """A dispute slash can leave active stake below exposure; the default then
+    reaches into the unbonding queue."""
+    env.stake(alice, 200 * GEN)
+    env.request(alice, bob, 500)                          # capacity 100
+    env.advance(timedelta(hours=25))
+    env.finalize(bob)
+    env.record_loan(bob, 100 * GEN)                       # pinned loan 100
+    env.request(alice, dave, 100)                         # capacity 20 -> committed 120
+    env.vm.sender = alice
+    env.c.initiate_unstake(80 * GEN)                      # leaves 120 == exposure
+    env.challenge(carol, dave)
+    env.resolve(dave, 700)                                # overturned: 50 + 5 from active
+    assert env.c.get_stake(alice) == 65 * GEN
+    env.default(bob)                                      # 100: 65 active + 35 unbonding
+    assert env.transfers == [(env.lender, 100 * GEN)]
+    assert env.c.get_stake(alice) == 0
+    assert env.c.get_unbonding(alice)["amount"] == 45 * GEN
+    env.assert_zero_wei([alice])
+    env.warp(timedelta(days=9))
+    env.vm.sender = alice
+    assert env.c.claim_unstaked() == 45 * GEN
+    env.assert_zero_wei([alice])
+
+
+def test_default_within_active_leaves_unbonding_intact(env, alice, bob):
+    env.stake(alice, 200 * GEN)
+    _lend(env, alice, bob, 800, 30 * GEN)                 # exposure 160
+    env.vm.sender = alice
+    env.c.initiate_unstake(40 * GEN)
+    env.default(bob)
+    assert env.c.get_stake(alice) == 130 * GEN
+    assert env.c.get_unbonding(alice)["amount"] == 40 * GEN
+    env.assert_zero_wei([alice])
+
+
 def test_dispute_slash_eats_unbonding(env, alice, bob, carol):
     env.stake(alice, 200 * GEN)
-    env.request(alice, bob, 100)                  # exposure 20
-    _unstake(env, alice, 180 * GEN)               # PENDING: allowed; active 20, unbonding 180
+    env.request(alice, bob, 100)
+    _unstake(env, alice, 180 * GEN)
     env.challenge(carol, bob)
-    env.resolve(bob, 700)                         # overturned
-    left = 180 * GEN - 30 * GEN - BOND            # slash 50 = 20 active + 30 unbonding; reward 5
+    env.resolve(bob, 700)
+    left = 180 * GEN - 30 * GEN - BOND
     assert env.c.get_stake(alice) == 0
     assert env.c.get_unbonding(alice)["amount"] == left
     assert env.c.get_treasury() == MIN_STAKE // 2
@@ -1129,7 +1529,7 @@ def test_dispute_lock_blocks_unstake_and_claim(env, alice, bob, carol):
     _unstake(env, alice, 20 * GEN)
     env.request(alice, bob, 400)
     assert env.c.get_disputed_count(alice) == 0
-    _unstake(env, alice, 5 * GEN)                 # PENDING does not lock
+    _unstake(env, alice, 5 * GEN)
     env.challenge(carol, bob)
     assert env.c.get_disputed_count(alice) == 1
     with env.vm.expect_revert("disputed scores"):
@@ -1138,7 +1538,7 @@ def test_dispute_lock_blocks_unstake_and_claim(env, alice, bob, carol):
     with env.vm.expect_revert("disputed scores"):
         _claim_unstaked(env, alice)
     env.assert_zero_wei([alice])
-    env.resolve(bob, 380)                         # upheld -> lock released
+    env.resolve(bob, 380)
     assert env.c.get_disputed_count(alice) == 0
     assert _claim_unstaked(env, alice) == 25 * GEN
     _unstake(env, alice, 1 * GEN)
@@ -1167,15 +1567,14 @@ def test_dispute_lock_counts_multiple_scores(env, alice, bob, carol, dave):
 # ======================================================================
 
 def test_full_lifecycle_zero_wei(env, alice, bob, carol, dave):
-    b = env.many
     env.stake(alice, 300 * GEN)
     env.stake(bob, 123 * GEN + 7)
-    env.request(alice, carol, 900)                # 270
+    env.request(alice, carol, 900)                        # 270
     env.request(bob, dave, 400)
     env.assert_zero_wei([alice, bob])
 
-    env.challenge(bob, carol)                     # overturned
-    env.challenge(alice, dave)                    # upheld
+    env.challenge(bob, carol, counter_url=COUNTER)        # overturned
+    env.challenge(alice, dave)                            # upheld
     env.assert_zero_wei([alice, bob])
     env.resolve(carol, 500)
     env.resolve(dave, 450)
@@ -1183,11 +1582,16 @@ def test_full_lifecycle_zero_wei(env, alice, bob, carol, dave):
     env.assert_exposure_invariant([alice, bob], [carol, dave])
 
     env.advance(timedelta(hours=1))
-    env.default(carol, 1000 * GEN)                # capped by committed exposure
-    env.default(dave, 5)
+    env.record_loan(carol, 50 * GEN)
+    env.record_loan(carol, 40 * GEN, lender=env.lender2)
+    env.record_loan(dave, 5)
+    env.assert_exposure_invariant([alice, bob], [carol, dave])
+    env.default(carol)
+    env.default(carol, lender=env.lender2)
+    env.default(dave)
     env.assert_zero_wei([alice, bob])
     env.assert_exposure_invariant([alice, bob], [carol, dave])
-    assert env.c.get_exposure(alice) == 0 and env.c.get_exposure(bob) == 0
+    assert env.c.get_loan_exposure(alice) == 0 and env.c.get_loan_exposure(bob) == 0
 
     for who in (alice, bob):
         if env.c.get_claimable(who):
@@ -1199,21 +1603,24 @@ def test_full_lifecycle_zero_wei(env, alice, bob, carol, dave):
 def test_everything_zero_wei(env, alice, bob, carol, dave):
     env.stake(alice, 300 * GEN)
     env.stake(bob, 120 * GEN)
-    env.request(alice, carol, 600)                # exposure 180
-    _unstake(env, alice, 120 * GEN)               # leaves 180 == exposure; still slashable
+    env.request(alice, carol, 600)                        # capacity 180
+    _unstake(env, alice, 120 * GEN)
     env.challenge(bob, carol)
     env.assert_zero_wei([alice, bob])
-    env.resolve(carol, 300)                       # overturned
-    env.request(bob, dave, 100)                   # exposure 12
+    env.resolve(carol, 300)                               # overturned
+    env.request(bob, dave, 100)                           # capacity 12
     _unstake(env, bob, 100 * GEN)
-    env.challenge(alice, dave)
-    env.resolve(dave, 320)                        # upheld (diff 220 <= 250)
+    env.challenge(alice, dave, counter_url=COUNTER)
+    env.resolve(dave, 320)                                # upheld
     env.assert_zero_wei([alice, bob])
     env.warp(timedelta(days=2))
-    assert env.c.get_score(dave)["state"] == "FINAL"
-    env.default(dave, 33 * GEN + 1)
+    env.record_loan(dave, 2 * GEN)                        # live power: 100 * 20 GEN / 1000
+    env.default(dave)
     env.assert_zero_wei([alice, bob])
-    env.warp(timedelta(days=30))
+    env.vm.sender = env.governor
+    env.c.claim_treasury(env.c.get_treasury() // 2, env.rando)
+    env.assert_zero_wei([alice, bob])
+    env.warp(timedelta(days=40))
     for who in (alice, bob):
         if env.c.get_unbonding(who)["amount"]:
             _claim_unstaked(env, who)
