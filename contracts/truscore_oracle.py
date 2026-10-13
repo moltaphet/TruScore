@@ -32,14 +32,27 @@ DEFAULT_DISPUTE_WINDOW = 3 * 24 * 60 * 60  # evaluator's window to dispute a rep
 CLOSURE_WINDOW = 7 * 24 * 60 * 60  # lender's window to report a default after a closure request
 TIMELOCK_DELAY = 3 * 24 * 60 * 60  # governor lender-whitelisting and treasury payouts wait this long
 
-# L1 consensus: validators accept a leader score within +/- VALIDATOR_TOLERANCE of
-# their own run. Two honest runs (original + dispute re-run) can therefore each sit
-# up to VALIDATOR_TOLERANCE from the "true" value and differ by twice that. A score
-# is only overturned when the re-run differs by MORE than this worst case plus a
-# margin, so honest consensus noise can never slash an evaluator.
-VALIDATOR_TOLERANCE = 100
-OVERTURN_MARGIN = 50
-OVERTURN_THRESHOLD = 2 * VALIDATOR_TOLERANCE + OVERTURN_MARGIN  # 250
+# Deterministic economic consensus (agreed buckets).
+# The LLM still produces a 0..MAX_SCORE solvency score, but the score is mapped
+# deterministically to a credit TIER and ONLY the tier is the consensus value: a
+# validator accepts a leader output iff its own run resolves to the EXACT SAME tier.
+# Borrow capacity is a pure function of (tier, evaluator stake), so every
+# validator-compatible output yields the identical borrowing outcome. There is no
+# numeric tolerance anywhere on the path that controls capacity.
+#
+# TIER_FLOORS[t] is the lowest score of tier t (tiers are contiguous and
+# non-overlapping: tier t covers TIER_FLOORS[t] .. TIER_FLOORS[t+1] - 1).
+# TIER_CAPACITY_BPS[t] is the borrow capacity of tier t in basis points of the
+# evaluator's stake (0 / 50% / 80% / 100%).
+TIER_FLOORS = (0, 500, 700, 850)
+TIER_CAPACITY_BPS = (0, 5000, 8000, 10000)
+BPS = 10000
+MAX_TIER = len(TIER_FLOORS) - 1
+
+# Honest runs (original + dispute re-run) can straddle one tier boundary. A score is
+# only overturned when the re-run differs by at least this many tiers, so honest
+# boundary noise can never slash an evaluator.
+OVERTURN_TIER_GAP = 2
 DUST_THRESHOLD = 10 * GEN  # a score offering less borrow power than this (and no loans) is squattable
 MAX_DATA_CHARS = 8000
 
@@ -95,6 +108,24 @@ def _is_safe_url(url: str) -> bool:
             ip = ip.ipv4_mapped
         return bool(ip.is_global) and not ip.is_multicast
     return True
+
+
+def _tier_of(score: int) -> int:
+    """Deterministic score -> tier. Tiers are non-overlapping and cover 0..MAX_SCORE."""
+    tier = 0
+    for i, floor in enumerate(TIER_FLOORS):
+        if score >= floor:
+            tier = i
+    return tier
+
+
+def _tier_capacity(tier: int, stake: int) -> int:
+    """Borrow capacity bound to a tier: a pure function of (tier, stake)."""
+    return (TIER_CAPACITY_BPS[tier] * stake) // BPS
+
+
+def _valid_tier(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_TIER
 
 
 def _parse_analysis(analysis) -> tuple[int, str]:
@@ -174,7 +205,7 @@ def _agree_on_leader_error(leaders_res, rerun) -> bool:
 @allow_storage
 @dataclass
 class SolvencyRecord:
-    score: u256
+    tier: u256  # the agreed credit tier: the ONLY value that controls capacity
     evaluator: Address
     timestamp: u256
     reasoning: str
@@ -356,7 +387,9 @@ class TruScoreOracle(gl.contract.Contract):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} No score for borrower")
         rec = self.solvency_scores[borrower]
         return {
-            "score": int(rec.score),
+            "tier": int(rec.tier),
+            "score": TIER_FLOORS[int(rec.tier)],  # canonical bucket score (tier floor)
+            "capacity_bps": TIER_CAPACITY_BPS[int(rec.tier)],
             "evaluator": rec.evaluator.as_hex,
             "timestamp": int(rec.timestamp),
             "reasoning": rec.reasoning,
@@ -369,10 +402,27 @@ class TruScoreOracle(gl.contract.Contract):
         }
 
     @gl.public.view
+    def get_tier_table(self) -> dict:
+        """The consensus-critical bucket table: tier t covers scores floors[t] up to
+        floors[t+1] - 1 and borrows capacity_bps[t] / 10000 of the evaluator's stake."""
+        return {
+            "floors": list(TIER_FLOORS),
+            "capacity_bps": list(TIER_CAPACITY_BPS),
+            "max_score": MAX_SCORE,
+            "overturn_tier_gap": OVERTURN_TIER_GAP,
+        }
+
+    @gl.public.view
+    def get_tier_for_score(self, score: int) -> int:
+        if score < 0 or score > MAX_SCORE:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Score out of range")
+        return _tier_of(score)
+
+    @gl.public.view
     def get_max_borrow_power(self, borrower: Address) -> int:
         """Remaining amount lenders may still record against this borrower: 0 unless
         the score is FINAL and at most 30 days old, otherwise the lesser of the
-        unlent committed capacity and the live (score * stake) less what is lent."""
+        unlent committed capacity and the live tier capacity less what is lent."""
         if borrower not in self.solvency_scores:
             return 0
         return self._borrow_power(self.solvency_scores[borrower])
@@ -570,7 +620,7 @@ class TruScoreOracle(gl.contract.Contract):
 
         result = self._analyze(data_url, "")
         stake = int(self.evaluators[sender])
-        borrow_power = (result["score"] * stake) // MAX_SCORE
+        borrow_power = _tier_capacity(result["tier"], stake)
 
         if locked:
             # ...except that ANY evaluator may outbid a locked score (so a dust score
@@ -595,7 +645,7 @@ class TruScoreOracle(gl.contract.Contract):
         self.active_exposure[sender] = u256(committed + borrow_power)
 
         self.solvency_scores[borrower] = SolvencyRecord(
-            score=u256(result["score"]),
+            tier=u256(result["tier"]),
             evaluator=sender,
             timestamp=u256(now),
             reasoning=result["reasoning"],
@@ -751,7 +801,7 @@ class TruScoreOracle(gl.contract.Contract):
     def resolve_dispute(self, borrower: Address) -> None:
         """Layer-2 escalation: ONE consensus analysis (a single run_nondet keeps the
         call inside block gas / time limits; GenLayer's validator consensus absorbs
-        LLM variance, and OVERTURN_THRESHOLD exceeds the worst honest disagreement)."""
+        LLM variance, and OVERTURN_TIER_GAP exceeds the worst honest boundary disagreement)."""
         rec = self._get_record(borrower)
         if rec.state != STATE_DISPUTED:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Score is not DISPUTED")
@@ -774,7 +824,7 @@ class TruScoreOracle(gl.contract.Contract):
             else:
                 raise
 
-        old_score = int(rec.score)
+        old_tier = int(rec.tier)
         bond = int(rec.bond)
         challenger = rec.challenger
         evaluator = rec.evaluator
@@ -783,18 +833,18 @@ class TruScoreOracle(gl.contract.Contract):
         self.total_escrow = u256(int(self.total_escrow) - bond)
         rec.bond = u256(0)
 
-        if unavailable or abs(verdict["score"] - old_score) > OVERTURN_THRESHOLD:
+        if unavailable or abs(verdict["tier"] - old_tier) >= OVERTURN_TIER_GAP:
             slash = self._slash(evaluator, int(self.min_stake) // 2)
             reward = self._slash(evaluator, bond)
             self.treasury = u256(int(self.treasury) + slash)
             self._credit(challenger, bond + reward)
-            new_score = 0 if unavailable else verdict["score"]
-            rec.score = u256(new_score)
+            new_tier = 0 if unavailable else verdict["tier"]
+            rec.tier = u256(new_tier)
             rec.reasoning = "Evidence unavailable at dispute time" if unavailable else verdict["reasoning"]
             # Never grow the commitment on overturn: keep at most the old capacity,
             # and no more than the corrected score supports on the remaining stake.
             stake = int(self.evaluators[evaluator]) if evaluator in self.evaluators else 0
-            keep = min(int(rec.exposure), (new_score * stake) // MAX_SCORE)
+            keep = min(int(rec.exposure), _tier_capacity(new_tier, stake))
             self._shrink_exposure(rec, keep)
         else:
             self.treasury = u256(int(self.treasury) + bond)
@@ -926,7 +976,7 @@ class TruScoreOracle(gl.contract.Contract):
             return 0
         if rec.evaluator not in self.evaluators:
             return 0
-        live = (int(rec.score) * int(self.evaluators[rec.evaluator])) // MAX_SCORE
+        live = _tier_capacity(int(rec.tier), int(self.evaluators[rec.evaluator]))
         remaining_live = max(0, live - int(rec.loaned))
         return min(int(rec.exposure), remaining_live)
 
@@ -971,7 +1021,7 @@ class TruScoreOracle(gl.contract.Contract):
         if borrower in self.solvency_scores:
             rec = self.solvency_scores[borrower]
             if rec.evaluator == evaluator and rec.state == STATE_FINAL:
-                rec.score = u256(0)
+                rec.tier = u256(0)
                 self._release_exposure(rec)
 
         paid = self._slash(evaluator, amount)
@@ -1132,7 +1182,9 @@ class TruScoreOracle(gl.contract.Contract):
                     prompt += "\nSource B (challenger's counter-evidence): unavailable.\n"
             analysis = gl.nondet.exec_prompt(prompt, response_format="json")
             score, reasoning = _parse_analysis(analysis)
-            return {"score": score, "reasoning": reasoning}
+            # Only the TIER is part of the consensus payload; the raw score never
+            # leaves the leader/validator run, so it cannot influence capacity.
+            return {"tier": _tier_of(score), "reasoning": reasoning}
 
         def validator_fn(leaders_res: gl.vm.Result) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
@@ -1141,6 +1193,14 @@ class TruScoreOracle(gl.contract.Contract):
                 mine = leader_fn()
             except Exception:
                 return False
-            return abs(mine["score"] - leaders_res.calldata["score"]) <= VALIDATOR_TOLERANCE
+            # Exact bucket equality: a leader output in a different tier is rejected
+            # however close the underlying scores are.
+            theirs = leaders_res.calldata
+            if not isinstance(theirs, dict) or not _valid_tier(theirs.get("tier")):
+                return False
+            return mine["tier"] == theirs["tier"]
 
-        return gl.vm.run_nondet(leader_fn, validator_fn)
+        result = gl.vm.run_nondet(leader_fn, validator_fn)
+        if not isinstance(result, dict) or not _valid_tier(result.get("tier")):
+            raise gl.vm.UserError(f"{ERROR_LLM} Invalid tier")
+        return result

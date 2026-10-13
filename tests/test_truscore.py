@@ -13,7 +13,7 @@ T0 = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
 WEEK = timedelta(days=7)
 TTL = timedelta(days=30)
 LOAN_TTL = timedelta(days=365)
-OVERTURN_THRESHOLD = 250
+OVERTURN_TIER_GAP = 2
 EPS = timedelta(seconds=1)
 FEE = GEN // 100                      # default evaluator fee paid with record_loan
 DEFAULT_WINDOW = timedelta(days=3)
@@ -191,8 +191,9 @@ class Env:
 
 
 @pytest.fixture
-def env(direct_vm, direct_deploy, monkeypatch):
-    c = direct_deploy(CONTRACT, MIN_STAKE, BOND)
+def env(request, direct_vm, direct_deploy, monkeypatch):
+    marker = request.node.get_closest_marker("min_stake")  # dust tests deploy a small minimum
+    c = direct_deploy(CONTRACT, marker.args[0] if marker else MIN_STAKE, BOND)
     e = Env(direct_vm, c)
 
     import genlayer.chain as chain_mod
@@ -342,7 +343,8 @@ def test_unchallenged_finalization(env, alice, bob, carol):
     env.stake(alice, 200 * GEN)
     env.request(alice, bob, 800)
     s = env.c.get_score(bob)
-    assert s["score"] == 800 and s["state"] == "PENDING" and s["challenger"] == ""
+    assert s["tier"] == 2 and s["score"] == 700 and s["capacity_bps"] == 8000
+    assert s["state"] == "PENDING" and s["challenger"] == ""
     assert s["timestamp"] == int(T0.timestamp())
     assert s["exposure"] == 160 * GEN and s["loaned"] == 0
 
@@ -389,9 +391,9 @@ def test_dispute_overturned(env, alice, bob, carol):
     assert env.c.get_accounting()["total_escrow"] == BOND
     env.assert_zero_wei([alice])
 
-    env.resolve(bob, 600)  # |600-900| = 300 > 250
+    env.resolve(bob, 600)  # tier 3 -> tier 1: gap 2 >= OVERTURN_TIER_GAP
     s = env.c.get_score(bob)
-    assert s["state"] == "FINAL" and s["score"] == 600
+    assert s["state"] == "FINAL" and s["tier"] == 1 and s["score"] == 500
 
     slash = MIN_STAKE // 2
     assert env.c.get_stake(alice) == stake - slash - BOND
@@ -416,16 +418,16 @@ def test_dispute_overturned_low_stake_caps_payouts(env, alice, bob, carol):
     env.assert_zero_wei([alice])
 
 
-@pytest.mark.parametrize("new_score", [900, 750, 650, 1000, 1049 - 1])
+@pytest.mark.parametrize("new_score", [1000, 900, 850, 849, 700])
 def test_dispute_upheld(env, alice, bob, carol, new_score):
     stake = 200 * GEN
     env.stake(alice, stake)
     env.request(alice, bob, 900)
     env.challenge(carol, bob)
-    env.resolve(bob, new_score)  # diff <= 250 (650 is exactly 250)
+    env.resolve(bob, new_score)  # re-run in tier 3 or tier 2: gap <= 1, upheld
 
     s = env.c.get_score(bob)
-    assert s["state"] == "FINAL" and s["score"] == 900
+    assert s["state"] == "FINAL" and s["tier"] == 3 and s["score"] == 850
     assert env.c.get_stake(alice) == stake
     assert env.c.get_treasury() == BOND
     assert env.c.get_claimable(carol) == 0
@@ -434,37 +436,37 @@ def test_dispute_upheld(env, alice, bob, carol, new_score):
 
 def test_overturn_boundary(env, alice, bob, carol, dave):
     env.stake(alice, 300 * GEN)
-    env.request(alice, bob, 400)
-    env.request(alice, dave, 400)
+    env.request(alice, bob, 600)                     # tier 1 (capacity 150)
+    env.request(alice, dave, 600)
     env.challenge(carol, bob)
     env.challenge(carol, dave)
-    env.resolve(bob, 400 + OVERTURN_THRESHOLD)       # diff 250 -> upheld
-    assert env.c.get_score(bob)["score"] == 400
-    env.resolve(dave, 400 + OVERTURN_THRESHOLD + 1)  # diff 251 -> overturned
-    assert env.c.get_score(dave)["score"] == 651
+    env.resolve(bob, 700)                            # tier 2: gap 1 -> upheld
+    assert env.c.get_score(bob)["tier"] == 1
+    env.resolve(dave, 850)                           # tier 3: gap 2 -> overturned
+    assert env.c.get_score(dave)["tier"] == 3
     assert env.c.get_claimable(carol) == 2 * BOND
     env.assert_zero_wei([alice])
 
 
-def test_validator_tolerance_noise_never_slashes(env, alice, bob, carol):
-    """449 vs 600 (diff 151) is within 2*VALIDATOR_TOLERANCE + margin: upheld."""
+def test_boundary_noise_never_slashes(env, alice, bob, carol):
+    """A re-run that lands one tier away (499 vs 600) is boundary noise: upheld."""
     env.stake(alice, 200 * GEN)
     env.request(alice, bob, 600)
     env.challenge(carol, bob)
-    env.resolve(bob, 449)
+    env.resolve(bob, 499)
     s = env.c.get_score(bob)
-    assert s["score"] == 600 and s["state"] == "FINAL"
+    assert s["tier"] == 1 and s["score"] == 500 and s["state"] == "FINAL"
     assert env.c.get_stake(alice) == 200 * GEN
     assert env.c.get_claimable(carol) == 0
     env.assert_zero_wei([alice])
 
 
-def test_dispute_single_run_noise_within_tolerance_never_overturns(env, alice, bob, carol):
-    """Worst honest disagreement (2 x tolerance) stays below the overturn threshold."""
+def test_dispute_single_tier_disagreement_never_overturns(env, alice, bob, carol):
+    """The worst honest disagreement (one tier) stays below OVERTURN_TIER_GAP."""
     env.stake(alice, 200 * GEN)
     env.request(alice, bob, 500)
     env.challenge(carol, bob)
-    env.resolve(bob, 500 - 2 * 100)               # re-run 200 lower: still upheld
+    env.resolve(bob, 300 + 100)                   # re-run one tier lower: still upheld
     assert env.c.get_score(bob)["score"] == 500
     assert env.c.get_claimable(carol) == 0
     env.assert_zero_wei([alice])
@@ -527,7 +529,7 @@ def test_dispute_weighs_both_sources_and_overturns(env, alice, bob, carol):
     env.c.resolve_dispute(bob)
 
     s = env.c.get_score(bob)
-    assert s["score"] == 100 and s["reasoning"] == "fraud"
+    assert s["tier"] == 0 and s["reasoning"] == "fraud"
     assert env.c.get_claimable(carol) == 2 * BOND
     env.assert_zero_wei([alice])
 
@@ -541,7 +543,7 @@ def test_dispute_without_counter_url_uses_only_source_a(env, alice, bob, carol):
     env.vm.mock_llm(r".*Solvency Score.*", llm_json(880, "fine"))
     env.vm.sender = env.rando
     env.c.resolve_dispute(bob)
-    assert env.c.get_score(bob)["score"] == 900     # upheld
+    assert env.c.get_score(bob)["tier"] == 3        # upheld
     assert env.c.get_claimable(carol) == 0
 
 
@@ -556,7 +558,7 @@ def test_unreachable_counter_url_does_not_slash_evaluator(env, alice, bob, carol
     env.vm.mock_llm(r".*Solvency Score.*", llm_json(880, "fine"))
     env.vm.sender = env.rando
     env.c.resolve_dispute(bob)                      # resolves normally on Source A alone
-    assert env.c.get_score(bob)["score"] == 900
+    assert env.c.get_score(bob)["tier"] == 3
     assert env.c.get_stake(alice) == 200 * GEN
     assert env.c.get_treasury() == BOND             # failed challenge forfeits the bond
     env.assert_zero_wei([alice])
@@ -601,7 +603,7 @@ def test_transient_http_error_reverts_without_slashing(env, alice, bob, carol, s
     with env.vm.expect_revert("TRANSIENT"):
         env.c.resolve_dispute(bob)
     s = env.c.get_score(bob)
-    assert s["state"] == "DISPUTED" and s["score"] == 900     # untouched
+    assert s["state"] == "DISPUTED" and s["tier"] == 3        # untouched
     assert env.c.get_stake(alice) == stake
     assert env.c.get_accounting()["total_escrow"] == BOND     # bond still safely escrowed
     assert env.c.get_claimable(carol) == 0
@@ -643,16 +645,16 @@ def test_persistent_transient_failure_counts_after_timeout(env, alice, bob, caro
 
 
 def test_missing_evidence_with_unbonded_stake_still_slashes(env, alice, bob, carol):
-    env.stake(alice, 200 * GEN)
-    env.request(alice, bob, 100)                 # capacity 20
+    env.stake(alice, MIN_STAKE)
+    env.request(alice, bob, 400)                 # tier 0: no capacity
     env.vm.sender = alice
-    env.c.initiate_unstake(180 * GEN)            # leaves exactly the exposure
+    env.c.initiate_unstake(MIN_STAKE)            # everything is in the unbonding queue
     env.challenge(carol, bob)
     env.mock_web_status(404)
     env.vm.sender = env.rando
     env.c.resolve_dispute(bob)
-    assert env.c.get_stake(alice) == 0           # slash 50 = 20 active + 30 unbonding
-    assert env.c.get_unbonding(alice)["amount"] == 180 * GEN - 30 * GEN - BOND
+    assert env.c.get_stake(alice) == 0           # slash 50 + reward 5 come out of unbonding
+    assert env.c.get_unbonding(alice)["amount"] == MIN_STAKE - MIN_STAKE // 2 - BOND
     env.assert_zero_wei([alice])
 
 
@@ -700,13 +702,14 @@ def test_validator_rejects_unclassified_leader_errors(env, alice, bob, message, 
     assert _validate_leader_error(env, message, seen) is False
 
 
-def test_validator_score_tolerance(env, alice, bob):
+def test_validator_requires_exact_tier(env, alice, bob):
     _captured_validator(env, alice, bob)
-    env.mock_score(600)
-    assert env.vm.run_validator(leader_result={"score": 500, "reasoning": "r"}) is True   # diff 100
-    assert env.vm.run_validator(leader_result={"score": 499, "reasoning": "r"}) is False  # diff 101
+    env.mock_score(600)                                                              # tier 1
+    assert env.vm.run_validator(leader_result={"tier": 1, "reasoning": "r"}) is True
+    assert env.vm.run_validator(leader_result={"tier": 2, "reasoning": "r"}) is False
+    assert env.vm.run_validator(leader_result={"tier": 0, "reasoning": "r"}) is False
     env.mock_web_status(404)
-    assert env.vm.run_validator(leader_result={"score": 600, "reasoning": "r"}) is False   # validator errors
+    assert env.vm.run_validator(leader_result={"tier": 1, "reasoning": "r"}) is False  # validator errors
 
 
 # ======================================================================
@@ -1051,7 +1054,7 @@ def test_score_with_zero_power_is_replaceable_by_any_evaluator(env, alice, bob, 
     assert env.c.get_max_borrow_power(carol) == 0
     env.request(bob, carol, 600)                          # immediately, within the 30 days
     s = env.c.get_score(carol)
-    assert s["evaluator"] == bob.as_hex and s["score"] == 600
+    assert s["evaluator"] == bob.as_hex and s["tier"] == 1
     env.assert_exposure_invariant([alice, bob], [carol])
     env.assert_zero_wei([alice, bob])
 
@@ -1078,7 +1081,7 @@ def test_active_score_with_capacity_cannot_be_lowered_before_expiry(env, alice, 
         with env.vm.expect_revert("cannot be replaced before expiry"):
             env.c.request_score_update(bob, URL)
     s = env.c.get_score(bob)
-    assert s["score"] == 800 and s["exposure"] == 160 * GEN
+    assert s["tier"] == 2 and s["exposure"] == 160 * GEN
     env.assert_zero_wei([alice])
 
 
@@ -1107,7 +1110,7 @@ def test_other_evaluator_cannot_overwrite_active_score(env, alice, bob, carol):
     with env.vm.expect_revert("belongs to another evaluator"):
         env.c.request_score_update(carol, URL)
     s = env.c.get_score(carol)
-    assert s["evaluator"] == alice.as_hex and s["score"] == 800
+    assert s["evaluator"] == alice.as_hex and s["tier"] == 2
     assert env.c.get_exposure(alice) == 160 * GEN
     assert env.c.get_exposure(bob) == 0
     env.assert_zero_wei([alice, bob])
@@ -1140,7 +1143,7 @@ def test_overwrite_allowed_after_expiry_and_frees_old_exposure(env, alice, bob, 
     s = env.c.get_score(carol)
     assert s["evaluator"] == bob.as_hex and s["state"] == "PENDING"
     assert env.c.get_exposure(alice) == 0
-    assert env.c.get_exposure(bob) == 120 * GEN
+    assert env.c.get_exposure(bob) == 100 * GEN
     env.assert_exposure_invariant([alice, bob], [carol])
     env.assert_zero_wei([alice, bob])
 
@@ -1150,8 +1153,8 @@ def test_replaced_after_expiry_frees_old_exposure(env, alice, bob):
     _finalize(env, alice, bob, 1000)
     assert env.c.get_exposure(alice) == 100 * GEN
     env.warp(TTL + timedelta(hours=1))
-    env.request(alice, bob, 300)
-    assert env.c.get_exposure(alice) == 30 * GEN
+    env.request(alice, bob, 600)
+    assert env.c.get_exposure(alice) == 50 * GEN
     assert env.c.get_score(bob)["state"] == "PENDING"
     env.assert_exposure_invariant([alice], [bob])
 
@@ -1164,15 +1167,15 @@ def test_exposure_cannot_exceed_stake(env, alice):
     b = env.many
     env.stake(alice, MIN_STAKE)
     env.request(alice, b[0], 600)
-    assert env.c.get_exposure(alice) == 60 * GEN
-    env.mock_score(500)
+    assert env.c.get_exposure(alice) == 50 * GEN
+    env.mock_score(700)                                   # tier 2 would commit 80 more
     env.vm.sender = alice
     with env.vm.expect_revert("Exposure exceeds stake"):
         env.c.request_score_update(b[1], URL)
-    assert env.c.get_exposure(alice) == 60 * GEN
-    env.request(alice, b[1], 400)
+    assert env.c.get_exposure(alice) == 50 * GEN
+    env.request(alice, b[1], 500)
     assert env.c.get_exposure(alice) == 100 * GEN
-    env.mock_score(1)
+    env.mock_score(500)
     env.vm.sender = alice
     with env.vm.expect_revert("Exposure exceeds stake"):
         env.c.request_score_update(b[2], URL)
@@ -1185,14 +1188,14 @@ def test_five_borrowers_cannot_leverage_100_gen_into_500(env, alice):
     env.stake(alice, MIN_STAKE)
     ok = 0
     for borrower in b[:5]:
-        env.mock_score(300)
+        env.mock_score(500)
         env.vm.sender = alice
         try:
             env.c.request_score_update(borrower, URL)
             ok += 1
         except Exception as ex:
             assert "Exposure exceeds stake" in str(ex)
-    assert ok == 3
+    assert ok == 2
     assert env.c.get_exposure(alice) <= 100 * GEN
     env.assert_exposure_invariant([alice], b)
 
@@ -1202,7 +1205,7 @@ def test_exposure_counts_open_loans(env, alice):
     env.stake(alice, MIN_STAKE)
     _lend(env, alice, b[0], 1000, 100 * GEN)              # whole stake lent
     env.request(alice, b[1], 0)                           # zero scores add nothing
-    env.mock_score(1)
+    env.mock_score(500)
     env.vm.sender = alice
     with env.vm.expect_revert("Exposure exceeds stake"):
         env.c.request_score_update(b[2], URL)
@@ -1264,8 +1267,8 @@ def test_overturn_does_not_grow_exposure(env, alice, bob, carol):
     env.challenge(carol, bob)
     env.resolve(bob, 900)
     s = env.c.get_score(bob)
-    assert s["score"] == 900
-    assert s["exposure"] <= 120 * GEN
+    assert s["tier"] == 3
+    assert s["exposure"] == 0                              # an overturn never grows capacity
     assert env.c.get_exposure(alice) == s["exposure"]
     env.assert_zero_wei([alice])
 
@@ -1318,11 +1321,11 @@ def test_borrow_power_expires_after_30_days(env, alice, bob):
 def test_borrow_power_math_and_dynamic_drop(env, alice, bob):
     assert env.c.get_max_borrow_power(bob) == 0
     env.stake(alice, 200 * GEN)
-    _finalize(env, alice, bob, 400)
-    assert env.c.get_max_borrow_power(bob) == (400 * 200 * GEN) // 1000
+    _finalize(env, alice, bob, 600)
+    assert env.c.get_max_borrow_power(bob) == 100 * GEN
     env.vm.sender = alice
     env.c.initiate_unstake(100 * GEN)
-    assert env.c.get_max_borrow_power(bob) == (400 * 100 * GEN) // 1000
+    assert env.c.get_max_borrow_power(bob) == 50 * GEN
 
 
 def test_topup_cannot_inflate_borrow_power(env, alice, bob):
@@ -1334,8 +1337,9 @@ def test_topup_cannot_inflate_borrow_power(env, alice, bob):
 
 def test_borrow_power_floor_division(env, alice, bob):
     env.stake(alice, MIN_STAKE + 1)
-    _finalize(env, alice, bob, 333)
-    assert env.c.get_max_borrow_power(bob) == (333 * (MIN_STAKE + 1)) // 1000
+    _finalize(env, alice, bob, 800)
+    assert (8000 * (MIN_STAKE + 1)) % 10000 != 0
+    assert env.c.get_max_borrow_power(bob) == (8000 * (MIN_STAKE + 1)) // 10000
 
 
 # ======================================================================
@@ -1358,13 +1362,14 @@ def test_cannot_unstake_below_exposure(env, alice, bob):
 
 def test_unstake_guard_counts_pending_scores_and_loans(env, alice):
     b = env.many
-    env.stake(alice, 300 * GEN)
-    _lend(env, alice, b[0], 400, 100 * GEN)               # capacity 120: 20 + loan 100
-    env.request(alice, b[1], 300)                         # PENDING 90
+    env.stake(alice, 400 * GEN)
+    _lend(env, alice, b[0], 600, 100 * GEN)               # capacity 200: 100 + loan 100
+    env.request(alice, b[1], 600)                         # PENDING 200: committed 400
+    env.stake(alice, 100 * GEN)                           # top-up leaves 100 GEN of slack
     env.vm.sender = alice
     with env.vm.expect_revert("below exposure"):
-        env.c.initiate_unstake(91 * GEN)                  # 300 - 91 = 209 < 210
-    env.c.initiate_unstake(90 * GEN)
+        env.c.initiate_unstake(101 * GEN)                 # 500 - 101 = 399 < 400
+    env.c.initiate_unstake(100 * GEN)
     env.assert_exposure_invariant([alice], b)
     env.assert_zero_wei([alice])
 
@@ -1480,14 +1485,14 @@ def test_second_unstake_accumulates_and_restarts_timer(env, alice):
 
 def test_below_min_stake_blocks_new_scores_only(env, alice, bob, carol):
     env.stake(alice, 150 * GEN)
-    _finalize(env, alice, bob, 300)
+    _finalize(env, alice, bob, 600)
     _unstake(env, alice, 51 * GEN)
     env.mock_score(500)
     env.vm.sender = alice
     with env.vm.expect_revert("not a staked evaluator"):
         env.c.request_score_update(carol, URL)
-    assert env.c.get_score(bob)["score"] == 300
-    assert env.c.get_max_borrow_power(bob) == 300 * 99 * GEN // 1000
+    assert env.c.get_score(bob)["tier"] == 1
+    assert env.c.get_max_borrow_power(bob) == 5000 * 99 * GEN // 10000
     env.assert_zero_wei([alice])
 
 
@@ -2126,16 +2131,17 @@ def test_non_lender_cannot_record_a_loan_even_with_a_fee(env, alice, bob, carol)
 # dust-score lockout  [#3]
 # ======================================================================
 
+@pytest.mark.min_stake(10 * GEN)
 def test_dust_score_can_be_outbid_by_any_evaluator(env, alice, bob, carol):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    _finalize(env, alice, carol, 1)                       # dust: borrow power 0.2 GEN, > 0
-    assert env.c.get_max_borrow_power(carol) == 200 * GEN // 1000
-    env.request(bob, carol, 600)                          # bob's power 120 GEN > 0.2 GEN, no loans
+    env.stake(alice, 10 * GEN)
+    env.stake(bob, 100 * GEN)
+    _finalize(env, alice, carol, 600)                     # tier 1 on 10 GEN: 5 GEN, dust but > 0
+    assert env.c.get_max_borrow_power(carol) == 5 * GEN
+    env.request(bob, carol, 600)                          # bob's power 50 GEN > 5 GEN, no loans
     s = env.c.get_score(carol)
-    assert s["evaluator"] == bob.as_hex and s["score"] == 600 and s["state"] == "PENDING"
+    assert s["evaluator"] == bob.as_hex and s["tier"] == 1 and s["state"] == "PENDING"
     assert env.c.get_exposure(alice) == 0                 # alice's dust commitment released
-    assert env.c.get_exposure(bob) == 120 * GEN
+    assert env.c.get_exposure(bob) == 50 * GEN
     env.assert_exposure_invariant([alice, bob], [carol])
     env.assert_zero_wei([alice, bob])
 
@@ -2143,32 +2149,32 @@ def test_dust_score_can_be_outbid_by_any_evaluator(env, alice, bob, carol):
 def test_outbid_requires_strictly_greater_borrow_power(env, alice, bob, carol):
     env.stake(alice, 200 * GEN)
     env.stake(bob, 200 * GEN)
-    _finalize(env, alice, carol, 400)                     # power 80 GEN
-    for new_score in (0, 100, 399, 400):                  # lower or equal: blocked
+    _finalize(env, alice, carol, 600)                     # tier 1: power 100 GEN
+    for new_score in (0, 100, 499, 500, 699):             # tier 0/1: lower or equal power
         env.mock_score(new_score)
         env.vm.sender = bob
         with env.vm.expect_revert("belongs to another evaluator"):
             env.c.request_score_update(carol, URL)
     assert env.c.get_score(carol)["evaluator"] == alice.as_hex
-    env.request(bob, carol, 401)                          # strictly greater: allowed
+    env.request(bob, carol, 700)                          # tier 2: 160 GEN, strictly greater
     assert env.c.get_score(carol)["evaluator"] == bob.as_hex
 
 
 def test_outbid_compares_borrow_power_not_the_raw_score(env, alice, bob, carol):
     env.stake(alice, 1000 * GEN)
     env.stake(bob, MIN_STAKE)
-    _finalize(env, alice, carol, 200)                     # power 200 GEN (big stake)
-    env.mock_score(900)                                   # bob: 900 * 100 GEN / 1000 = 90 GEN < 200
+    _finalize(env, alice, carol, 600)                     # tier 1 on a big stake: 500 GEN
+    env.mock_score(900)                                   # bob: tier 3 on 100 GEN = 100 GEN < 500
     env.vm.sender = bob
     with env.vm.expect_revert("belongs to another evaluator"):
         env.c.request_score_update(carol, URL)
-    assert env.c.get_score(carol)["score"] == 200
+    assert env.c.get_score(carol)["tier"] == 1
 
 
 def test_outbid_blocked_once_any_loan_is_open(env, alice, bob, carol):
     env.stake(alice, 200 * GEN)
     env.stake(bob, 200 * GEN)
-    _lend(env, alice, carol, 400, 1)                       # a 1 wei loan still counts
+    _lend(env, alice, carol, 600, 1)                       # a 1 wei loan still counts
     assert env.c.get_score(carol)["open_loans"] == 1
     env.mock_score(1000)
     env.vm.sender = bob
@@ -2212,26 +2218,28 @@ def test_cannot_outbid_a_pending_or_disputed_score(env, alice, bob, carol, dave)
         env.c.request_score_update(carol, URL)
 
 
+@pytest.mark.min_stake(10 * GEN)
 def test_owner_may_raise_its_own_dust_score(env, alice, carol):
-    env.stake(alice, 200 * GEN)
-    _finalize(env, alice, carol, 1)
-    env.request(alice, carol, 500)
-    assert env.c.get_score(carol)["score"] == 500
-    assert env.c.get_exposure(alice) == 100 * GEN             # old dust released, new committed
+    env.stake(alice, 10 * GEN)
+    _finalize(env, alice, carol, 600)                     # 5 GEN: dust
+    env.request(alice, carol, 900)
+    assert env.c.get_score(carol)["tier"] == 3
+    assert env.c.get_exposure(alice) == 10 * GEN              # old dust released, new committed
     env.assert_exposure_invariant([alice], [carol])
 
 
+@pytest.mark.min_stake(10 * GEN)
 def test_outbid_still_respects_exposure_cap(env, alice, bob, carol):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, MIN_STAKE)
-    _finalize(env, alice, carol, 1)
-    env.request(bob, env.many[0], 900)                         # bob already committed 90 of 100
-    env.mock_score(500)                                        # 50 GEN more would exceed bob's stake
+    env.stake(alice, 10 * GEN)
+    env.stake(bob, 10 * GEN)
+    _finalize(env, alice, carol, 600)                          # alice: 5 GEN dust
+    env.request(bob, env.many[0], 900)                         # bob already committed all 10 GEN
+    env.mock_score(600)                                        # 5 GEN more would exceed bob's stake
     env.vm.sender = bob
     with env.vm.expect_revert("Exposure exceeds stake"):
         env.c.request_score_update(carol, URL)
     assert env.c.get_score(carol)["evaluator"] == alice.as_hex   # alice's dust score survives the revert
-    assert env.c.get_exposure(alice) == 200 * GEN // 1000
+    assert env.c.get_exposure(alice) == 5 * GEN
     env.assert_exposure_invariant([alice, bob], [carol, env.many[0]])
 
 
@@ -2248,7 +2256,7 @@ def test_resolve_dispute_takes_no_median_flag(env, alice, bob, carol):
     with pytest.raises(Exception):
         env.c.resolve_dispute(bob, True)                       # the old two-argument form is gone
     env.c.resolve_dispute(bob)
-    assert env.c.get_score(bob)["score"] == 100                # the single run decided
+    assert env.c.get_score(bob)["tier"] == 0                   # the single run decided
     assert env.c.get_claimable(carol) == 2 * BOND
     env.assert_zero_wei([alice])
 
@@ -2276,7 +2284,7 @@ def test_single_run_calls_llm_once(env, alice, bob, carol, monkeypatch):
 def test_missing_evidence_and_upheld_scores(env, alice, bob, carol, dave):
     env.stake(alice, 1000 * GEN)
     env.request(alice, bob, 500)
-    env.request(alice, dave, 400)
+    env.request(alice, dave, 600)
     env.challenge(carol, bob)
     env.challenge(carol, dave)
     env.mock_web_status(404)
@@ -2284,7 +2292,7 @@ def test_missing_evidence_and_upheld_scores(env, alice, bob, carol, dave):
     env.c.resolve_dispute(bob)
     assert env.c.get_score(bob)["score"] == 0
     env.resolve(dave, 380)
-    assert env.c.get_score(dave)["score"] == 400
+    assert env.c.get_score(dave)["tier"] == 1
     env.assert_zero_wei([alice])
 
 
@@ -2486,44 +2494,48 @@ def test_old_instant_governor_entry_points_are_gone(env):
 # dust-score squatting prevention (< 10 GEN, no loans)
 # ======================================================================
 
+@pytest.mark.min_stake(10 * GEN)
 def test_dust_score_is_overwritten_by_any_evaluator_even_with_lower_power(env, alice, bob, carol):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    _finalize(env, alice, carol, 45)                      # 9 GEN < 10 GEN: dust
-    env.request(bob, carol, 10)                           # LOWER power (2 GEN): still allowed
+    env.stake(alice, 10 * GEN)
+    env.stake(bob, 10 * GEN)
+    _finalize(env, alice, carol, 800)                     # tier 2 on 10 GEN: 8 GEN < 10 GEN: dust
+    env.request(bob, carol, 600)                          # LOWER power (5 GEN): still allowed
     assert env.c.get_score(carol)["evaluator"] == bob.as_hex
     assert env.c.get_exposure(alice) == 0
     env.assert_exposure_invariant([alice, bob], [carol])
     env.assert_zero_wei([alice, bob])
 
 
+@pytest.mark.min_stake(10 * GEN)
 def test_score_at_the_dust_threshold_is_still_locked(env, alice, bob, carol):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    _finalize(env, alice, carol, 50)                      # exactly 10 GEN: not dust
-    env.mock_score(10)
+    env.stake(alice, 10 * GEN)
+    env.stake(bob, 10 * GEN)
+    _finalize(env, alice, carol, 900)                     # tier 3 on 10 GEN: exactly 10 GEN: not dust
+    env.mock_score(600)
     env.vm.sender = bob
     with env.vm.expect_revert("belongs to another evaluator"):
         env.c.request_score_update(carol, URL)
     assert env.c.get_score(carol)["evaluator"] == alice.as_hex
 
 
+@pytest.mark.min_stake(10 * GEN)
 def test_dust_score_with_an_open_loan_is_protected(env, alice, bob, carol):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    _lend(env, alice, carol, 45, 1)                       # dust, but a loan is open
-    env.mock_score(10)
+    env.stake(alice, 10 * GEN)
+    env.stake(bob, 10 * GEN)
+    _lend(env, alice, carol, 600, 1)                      # dust, but a loan is open
+    env.mock_score(900)                                   # even strictly greater power is refused
     env.vm.sender = bob
     with env.vm.expect_revert("belongs to another evaluator"):
         env.c.request_score_update(carol, URL)
     assert env.c.get_loan(carol, env.lender)["amount"] == 1
 
 
+@pytest.mark.min_stake(10 * GEN)
 def test_pending_or_disputed_dust_score_is_still_protected(env, alice, bob, carol, dave):
-    env.stake(alice, 200 * GEN)
-    env.stake(bob, 200 * GEN)
-    env.request(alice, carol, 45)                         # PENDING, inside the challenge window
-    env.mock_score(10)
+    env.stake(alice, 10 * GEN)
+    env.stake(bob, 10 * GEN)
+    env.request(alice, carol, 600)                        # PENDING, inside the challenge window
+    env.mock_score(900)
     env.vm.sender = bob
     with env.vm.expect_revert("still in challenge process"):
         env.c.request_score_update(carol, URL)
@@ -2540,8 +2552,8 @@ def test_pending_or_disputed_dust_score_is_still_protected(env, alice, bob, caro
 def test_full_lifecycle_zero_wei(env, alice, bob, carol, dave):
     env.stake(alice, 300 * GEN)
     env.stake(bob, 123 * GEN + 7)
-    env.request(alice, carol, 900)                        # 270
-    env.request(bob, dave, 400)
+    env.request(alice, carol, 900)                        # tier 3: 300
+    env.request(bob, dave, 600)                           # tier 1
     env.assert_zero_wei([alice, bob])
 
     env.challenge(bob, carol, counter_url=COUNTER)        # overturned
@@ -2574,18 +2586,18 @@ def test_full_lifecycle_zero_wei(env, alice, bob, carol, dave):
 def test_everything_zero_wei(env, alice, bob, carol, dave):
     env.stake(alice, 300 * GEN)
     env.stake(bob, 120 * GEN)
-    env.request(alice, carol, 600)                        # capacity 180
-    _unstake(env, alice, 120 * GEN)
+    env.request(alice, carol, 800)                        # tier 2: capacity 240
+    _unstake(env, alice, 50 * GEN)
     env.challenge(bob, carol)
     env.assert_zero_wei([alice, bob])
-    env.resolve(carol, 300)                               # overturned
-    env.request(bob, dave, 100)                           # capacity 12
-    _unstake(env, bob, 100 * GEN)
+    env.resolve(carol, 300)                               # tier 0: overturned
+    env.request(bob, dave, 600)                           # tier 1: capacity 60
+    _unstake(env, bob, 60 * GEN)
     env.challenge(alice, dave, counter_url=COUNTER)
     env.resolve(dave, 320)                                # upheld
     env.assert_zero_wei([alice, bob])
     env.warp(timedelta(days=2))
-    env.record_loan(dave, 2 * GEN)                        # live power: 100 * 20 GEN / 1000
+    env.record_loan(dave, 2 * GEN)                        # live power: tier 1 on 60 GEN = 30 GEN
     env.default(dave)
     env.assert_zero_wei([alice, bob])
     env.claim_treasury(env.c.get_treasury() // 2, env.rando)
@@ -2600,3 +2612,213 @@ def test_everything_zero_wei(env, alice, bob, carol, dave):
             env.withdraw(who)
         env.assert_zero_wei([alice, bob])
     assert env.c.get_accounting()["total_claimable"] == 0
+
+
+# ======================================================================
+# deterministic economic consensus: agreed buckets (steward finding)
+#
+# Direct mode runs the leader once; `run_validator` then executes the REAL
+# validator_fn against (a) the validator's own mocked world and (b) a leader
+# output we forge. This is exactly the check a GenLayer validator performs.
+# ======================================================================
+
+FLOORS = [0, 500, 700, 850]          # independent reference copy of the bucket table
+CAP_BPS = [0, 5000, 8000, 10000]
+OLD_TOLERANCE = 100                  # the retired +/-100 score tolerance
+
+
+def ref_tier(score):
+    return max(i for i, f in enumerate(FLOORS) if score >= f)
+
+
+def ref_capacity(score, stake):
+    return CAP_BPS[ref_tier(score)] * stake // 10000
+
+
+def _leader_payload(tier):
+    return {"tier": tier, "reasoning": "forged"}
+
+
+def test_tier_table_is_contiguous_and_matches_reference(env):
+    t = env.c.get_tier_table()
+    assert t["floors"] == FLOORS and t["capacity_bps"] == CAP_BPS
+    assert t["floors"][0] == 0 and t["floors"] == sorted(set(t["floors"]))
+    assert t["capacity_bps"] == sorted(t["capacity_bps"]) and t["capacity_bps"][0] == 0
+    assert t["max_score"] == 1000 and t["overturn_tier_gap"] == OVERTURN_TIER_GAP
+    for score in range(0, 1001):                      # every score maps to exactly one tier
+        assert env.c.get_tier_for_score(score) == ref_tier(score)
+    with env.vm.expect_revert("out of range"):
+        env.c.get_tier_for_score(1001)
+    with env.vm.expect_revert("out of range"):
+        env.c.get_tier_for_score(-1)
+
+
+def test_borderline_leader_cannot_push_borrower_into_higher_tier(env, alice, bob):
+    """Leader claims 700 (tier 2, 80%); an honest validator computes 699 (tier 1, 50%).
+    The scores differ by 1 -- the retired +/-100 tolerance accepted this and the
+    capacity differed by 30% of the stake. Exact bucket equality rejects it."""
+    env.stake(alice, 200 * GEN)
+    env.request(alice, bob, 700)                               # leader's run: tier 2
+    assert env.c.get_score(bob)["exposure"] == 160 * GEN
+    assert abs(700 - 699) <= OLD_TOLERANCE                     # old rule would have passed
+
+    env.mock_score(699)                                        # validator's own evaluation
+    assert env.vm.run_validator() is False                     # stored leader output: tier 2
+    assert env.vm.run_validator(leader_result=_leader_payload(2)) is False
+    assert env.vm.run_validator(leader_result=_leader_payload(1)) is True
+
+
+@pytest.mark.parametrize("validator_score,forged_tier", [
+    (0, 1), (499, 1), (500, 2), (699, 2), (700, 3), (849, 3),    # one tier up, all borderline
+    (1000, 2), (850, 1), (700, 0),                               # downward / multi-tier forgery
+])
+def test_validator_rejects_any_leader_tier_other_than_its_own(env, alice, bob, validator_score, forged_tier):
+    _captured_validator(env, alice, bob)
+    env.mock_score(validator_score)
+    assert forged_tier != ref_tier(validator_score)
+    assert env.vm.run_validator(leader_result=_leader_payload(forged_tier)) is False
+    assert env.vm.run_validator(leader_result=_leader_payload(ref_tier(validator_score))) is True
+
+
+def test_acceptance_is_exactly_bucket_equality_for_every_score(env, alice, bob):
+    """For all 1001 validator scores and all 4 leader tiers: accept <=> same bucket."""
+    _captured_validator(env, alice, bob)
+    for v in range(0, 1001):
+        env.mock_score(v)
+        for t in range(4):
+            expected = (t == ref_tier(v))
+            assert env.vm.run_validator(leader_result=_leader_payload(t)) is expected, (v, t)
+
+
+@pytest.mark.parametrize("bad", [
+    {"score": 700, "reasoning": "r"},           # legacy payload: no tier -> never trusted
+    {"tier": 4, "reasoning": "r"},              # out of range
+    {"tier": -1, "reasoning": "r"},
+    {"tier": "2", "reasoning": "r"},            # wrong type
+    {"tier": 2.0, "reasoning": "r"},
+    {"tier": True, "reasoning": "r"},           # bool is not a tier
+    {"tier": None, "reasoning": "r"},
+    {},
+    [],
+    "tier",
+    None,
+])
+def test_malformed_leader_payloads_are_rejected(env, alice, bob, bad):
+    _captured_validator(env, alice, bob)
+    env.mock_score(700)
+    assert env.vm.run_validator(leader_result=bad) is False
+
+
+def test_extra_leader_fields_cannot_move_capacity(env, alice, bob):
+    """A leader smuggling a continuous `score` next to an agreed tier: the validator
+    compares tiers only, and the contract stores only the tier (score is the tier floor)."""
+    env.stake(alice, 200 * GEN)
+    env.request(alice, bob, 720)                               # tier 2
+    env.mock_score(710)                                        # validator: tier 2
+    assert env.vm.run_validator(leader_result={"tier": 2, "score": 849, "reasoning": "r"}) is True
+    s = env.c.get_score(bob)
+    assert s["tier"] == 2 and s["score"] == 700                # canonical floor, not 720
+    assert s["exposure"] == ref_capacity(720, 200 * GEN)
+
+
+def test_every_validator_compatible_output_yields_identical_capacity(env, alice, bob, carol):
+    """Take every leader score; every validator that accepts it must have the same
+    bucket, hence the same capacity. Across all 1001 scores the capacity takes exactly
+    4 distinct values and is constant inside each bucket."""
+    stake = 200 * GEN
+    env.stake(alice, stake)
+    by_tier = {0: set(), 1: set(), 2: set(), 3: set()}
+    snap = env.vm.snapshot()
+    for leader_score in range(0, 1001, 7):
+        env.request(alice, bob, leader_score)
+        cap = env.c.get_score(bob)["exposure"]
+        tier = env.c.get_score(bob)["tier"]
+        assert tier == ref_tier(leader_score) and cap == ref_capacity(leader_score, stake)
+        # validators whose own score is anywhere in the SAME bucket accept...
+        lo = FLOORS[tier]
+        hi = (FLOORS[tier + 1] - 1) if tier < 3 else 1000
+        for v in (lo, (lo + hi) // 2, hi):
+            env.mock_score(v)
+            assert env.vm.run_validator() is True
+        # ...and every other bucket's validator rejects, however close the score is.
+        for v in (lo - 1, hi + 1):
+            if 0 <= v <= 1000:
+                env.mock_score(v)
+                assert env.vm.run_validator() is False
+        by_tier[tier].add(cap)
+        env.vm.revert(snap)
+        snap = env.vm.snapshot()
+    assert all(len(caps) == 1 for caps in by_tier.values())
+    assert sorted(next(iter(c)) for c in by_tier.values()) == [0, 100 * GEN, 160 * GEN, 200 * GEN]
+
+
+def test_zero_economic_drift_across_independent_validators(env, alice, bob):
+    """Five independent validators see differently-noisy scores for the same evidence.
+    Under the old rule a leader at 760 was accepted by validators at 660..860, spanning
+    tiers 1..3 (50%..100% of stake). Now only the validators in the leader's bucket
+    accept, and they all apply the identical capacity."""
+    stake = 200 * GEN
+    env.stake(alice, stake)
+    env.request(alice, bob, 760)                               # leader: tier 2
+    leader = env.vm.run_validator                              # stored leader output (tier 2)
+
+    old_accepting = [v for v in range(0, 1001) if abs(v - 760) <= OLD_TOLERANCE]
+    assert {ref_tier(v) for v in old_accepting} == {1, 2, 3}   # the retired rule's drift
+    assert len({ref_capacity(v, stake) for v in old_accepting}) == 3
+
+    accepting = []
+    for v in range(0, 1001):
+        env.mock_score(v)
+        if leader() is True:
+            accepting.append(v)
+    assert accepting == list(range(700, 850))                  # exactly the bucket
+    assert {ref_capacity(v, stake) for v in accepting} == {ref_capacity(760, stake)}
+    assert env.c.get_score(bob)["exposure"] == 160 * GEN
+
+
+@pytest.mark.parametrize("score,tier,cap_gen", [
+    (0, 0, 0), (499, 0, 0), (500, 1, 100), (699, 1, 100),
+    (700, 2, 160), (849, 2, 160), (850, 3, 200), (1000, 3, 200),
+])
+def test_borrow_capacity_is_bound_to_bucket_at_every_boundary(env, alice, bob, score, tier, cap_gen):
+    env.stake(alice, 200 * GEN)
+    _finalize(env, alice, bob, score)
+    s = env.c.get_score(bob)
+    assert s["tier"] == tier and s["score"] == FLOORS[tier] and s["capacity_bps"] == CAP_BPS[tier]
+    assert env.c.get_max_borrow_power(bob) == cap_gen * GEN
+    if cap_gen:
+        env.record_loan(bob, cap_gen * GEN)
+        with env.vm.expect_revert("exceeds borrow power"):
+            env.record_loan(bob, 1, lender=env.lender2)
+    else:
+        with env.vm.expect_revert("exceeds borrow power"):
+            env.record_loan(bob, 1)
+    env.assert_zero_wei([alice])
+
+
+def test_capacity_does_not_depend_on_unagreed_score_variation(env, alice, bob, carol):
+    """Same evidence, two honest runs at different raw scores in one bucket: the
+    resulting records are identical in every economically relevant field."""
+    env.stake(alice, 200 * GEN)
+    env.stake(env.many[0], 200 * GEN)
+    _finalize(env, alice, bob, 705)
+    _finalize(env, env.many[0], carol, 845)
+    a, c = env.c.get_score(bob), env.c.get_score(carol)
+    for field in ("tier", "score", "capacity_bps", "exposure"):
+        assert a[field] == c[field]
+    assert env.c.get_max_borrow_power(bob) == env.c.get_max_borrow_power(carol) == 160 * GEN
+
+
+def test_dispute_noise_across_a_boundary_never_slashes_but_two_tiers_does(env, alice, bob, carol):
+    env.stake(alice, 200 * GEN)
+    env.request(alice, bob, 500)                               # tier 1
+    env.challenge(carol, bob)
+    env.resolve(bob, 499)                                      # adjacent bucket: honest noise
+    assert env.c.get_score(bob)["tier"] == 1 and env.c.get_claimable(carol) == 0
+
+    env.request(alice, env.many[0], 500)
+    env.challenge(carol, env.many[0])
+    env.resolve(env.many[0], 850)                              # two buckets away: overturned
+    assert env.c.get_score(env.many[0])["tier"] == 3
+    assert env.c.get_claimable(carol) == 2 * BOND
+    env.assert_zero_wei([alice])

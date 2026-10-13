@@ -4,14 +4,14 @@
 
 TruScore lets institutions with skin in the game vouch for a borrower's solvency on-chain. Staked
 *evaluators* have an LLM-backed validator network turn off-chain financial data into a **Solvency
-Score** (`0` = guaranteed default, `1000` = risk-free). Whitelisted *lenders* register each loan on-chain
+Score** (`0` = guaranteed default, `1000` = risk-free) that validators reduce to an agreed **credit tier**; only the tier controls borrowing capacity. Whitelisted *lenders* register each loan on-chain
 against that score and pay the evaluator a fee. If the borrower defaults, the lender is paid directly from
 the evaluator's stake (after a dispute window), so the evaluator is financially liable for every loan its
 score enabled.
 
 ```
 contracts/truscore_oracle.py   the oracle (GenVM / Python)
-tests/test_truscore.py         248 direct-mode tests, including negative tests for every exploit class
+tests/test_truscore.py         284 direct-mode tests, including adversarial validator-consensus tests for the agreed-bucket design
 deploy/deployScript.ts         `genlayer deploy` script (derives the network fee deposit)
 ```
 
@@ -26,6 +26,46 @@ deploy/deployScript.ts         `genlayer deploy` script (derives the network fee
 >    `propose_claim_treasury` and can only execute 3 days later - watch the proposals.
 > 3. **Seed the evidence-domain whitelist before use.** A fresh deployment has *no* allowed domains, so no
 >    score can be requested until the governor calls `whitelist_domain` for each trusted credit API or IPFS gateway.
+
+---
+
+## Deterministic Economic Consensus (Agreed Buckets)
+
+**Steward finding addressed.** The earlier design let validators accept a leader score within +/-100 of their
+own run, while borrowing capacity was computed *continuously* from the accepted score. Two validator-compatible
+outputs (say 660 and 760) could therefore both pass consensus and yield materially different credit allocations.
+
+**Fix.** The consensus value is no longer a number with a tolerance - it is a **tier** (bucket), and capacity is
+a pure function of that tier.
+
+| Tier | Score range | Borrow capacity (share of the evaluator's stake) | Capacity @ 200 GEN stake |
+|---|---|---|---|
+| 0 | 0 - 499 | 0% | 0 GEN |
+| 1 | 500 - 699 | 50% | 100 GEN |
+| 2 | 700 - 849 | 80% | 160 GEN |
+| 3 | 850 - 1000 | 100% | 200 GEN |
+
+Tiers are contiguous and non-overlapping (`TIER_FLOORS = (0, 500, 700, 850)`,
+`TIER_CAPACITY_BPS = (0, 5000, 8000, 10000)`); the table is readable on-chain via `get_tier_table()` and
+`get_tier_for_score(score)`.
+
+1. **The leader/validator payload carries the tier, not the score.** `_analyze` maps the LLM score to a tier with
+   the deterministic `_tier_of` and returns `{"tier", "reasoning"}`; the raw score never leaves the run.
+2. **Exact bucket equality.** A validator accepts a leader output iff its *own* independent run resolves to the
+   **same tier**. A leader at 700 (tier 2) is rejected by a validator at 699 (tier 1) although the scores differ
+   by one - the old rule accepted it and the capacities differed by 30% of the stake. Malformed payloads
+   (missing/out-of-range/non-integer tier, legacy `score`-only payloads) are rejected.
+3. **Capacity is bound strictly to the agreed bucket.** `capacity = TIER_CAPACITY_BPS[tier] x stake / 10000`
+   is the only formula used in `request_score_update`, `_borrow_power` and dispute resolution. Stored
+   records hold the tier; `get_score().score` is the canonical tier floor, never the leader's raw number.
+4. **Therefore every validator-compatible output preserves the same borrowing outcome**: all validators that
+   accept a leader output share its tier, and the tier fixes the capacity - zero economic drift.
+5. **Disputes are tier-based.** A challenge overturns a score only when the re-run is `OVERTURN_TIER_GAP = 2`
+   or more tiers away; one-tier disagreement (boundary noise) never slashes an honest evaluator.
+
+The cost of exactness is that a leader whose run lands next to a boundary can be rejected by validators on the
+other side; GenLayer then rotates the leader. That is intended: the protocol prefers a retry over letting two
+different allocations pass.
 
 ---
 
@@ -63,7 +103,7 @@ deploy/deployScript.ts         `genlayer deploy` script (derives the network fee
 | **Challenger** | Anyone; posts a `challenge_bond` (default 5 GEN) and optional counter-evidence to dispute a `PENDING` score. |
 | **Lender** | Governor-whitelisted protocol. Registers each loan with `record_loan` (paying the evaluator's fee) **before** any default can be reported, and settles only its own loan. |
 | **Governor** | Manages the lender and evidence-domain whitelists and routes the **treasury** via the timelocked `propose_/execute_claim_treasury`. **Must be a multisig.** It can never touch evaluator stake or default proceeds, cannot be a lender and cannot send treasury funds to itself - but these are address checks only, so a single-key Governor could still use an alias address. Lender additions and treasury payouts therefore sit behind a **3-day timelock**: every proposal is visible on-chain before it takes effect. A multisig remains strictly required. |
-| **Validators** | GenLayer consensus: the leader runs the LLM analysis, validators re-run it, accept a score within +/-100, and agree on failures they independently reproduce. |
+| **Validators** | GenLayer consensus: the leader runs the LLM analysis, validators re-run it, accept a leader output only if it resolves to the **same credit tier** as their own run, and agree on failures they independently reproduce. |
 
 ### Key parameters
 
@@ -76,8 +116,9 @@ deploy/deployScript.ts         `genlayer deploy` script (derives the network fee
 | `DEFAULT_DISPUTE_WINDOW` | 3 days | Evaluator's window to contest a reported default. |
 | `CLOSURE_WINDOW` | 7 days | Lender's window to report a default after the evaluator requests closure. |
 | `UNBONDING_PERIOD` | 7 days | Delay before unstaked funds can be claimed. |
-| `VALIDATOR_TOLERANCE` | 100 | L1 consensus tolerance on a score. |
-| `OVERTURN_THRESHOLD` | 250 | `2 x tolerance + 50`: a dispute overturns only beyond this difference. |
+| `TIER_FLOORS` | `0, 500, 700, 850` | Lowest score of each credit tier (the agreed bucket). |
+| `TIER_CAPACITY_BPS` | `0, 5000, 8000, 10000` | Borrow capacity of each tier, in basis points of the evaluator's stake. |
+| `OVERTURN_TIER_GAP` | 2 | A dispute overturns only when the re-run is at least this many tiers away. |
 | `TIMELOCK_DELAY` | 3 days | Delay between proposing and executing a lender whitelisting or treasury payout. |
 | `DUST_THRESHOLD` | 10 GEN | A score with less borrow power than this (and no open loans) can be overwritten by anyone. |
 | `DISPUTE_TIMEOUT` | 7 days | After this, persistent transient evidence failures count against the evaluator. |
@@ -89,7 +130,7 @@ deploy/deployScript.ts         `genlayer deploy` script (derives the network fee
 The protocol is designed so that the only profitable behaviour is honest evaluation.
 
 - **Evaluators are paid for, and liable for, the risk they take.** A score commits *capacity*
-  (`score x stake / 1000`) against the evaluator's stake; each loan a lender registers is drawn from that
+  (`tier capacity x stake`, e.g. 80% of stake for tier 2) against the evaluator's stake; each loan a lender registers is drawn from that
   capacity, **pinned** as exposure, and earns the evaluator an upfront **fee** (`record_loan(..., fee_amount)`,
   withdrawable immediately, never staked, never refunded). A confirmed default is paid from the stake.
 - **Exposure is conserved.** Capacity plus open loans across all of an evaluator's scores may never exceed
@@ -106,9 +147,9 @@ The protocol is designed so that the only profitable behaviour is honest evaluat
   one with strictly greater borrow power, provided nothing has been lent against the current score. A **dust**
   score (borrow power under 10 GEN, no open loans) can be overwritten by anyone immediately, even with a
   lower score, so it cannot lock a borrower out for 30 days.
-- **Honest scores are never punished for LLM noise.** Validators tolerate +/-100, so an honest original and
-  an honest re-run can differ by up to 200. A dispute only overturns beyond 250, so consensus noise on the single
-  dispute run cannot slash anyone.
+- **Honest scores are never punished for LLM noise.** Validators agree on the tier, so an honest original and
+  an honest re-run can straddle at most one boundary. A dispute only overturns at 2 or more tiers' distance, so
+  consensus noise on the single dispute run cannot slash anyone.
 - **Challengers are paid for being right and pay for being wrong.** A successful challenge returns the bond
   plus a reward equal to the bond, taken from the evaluator. A failed one forfeits the bond to the treasury.
   Counter-evidence must come from a whitelisted domain, so a challenger cannot flood the LLM with fabricated
@@ -181,15 +222,15 @@ funds remain slashable.** An evaluator with any `DISPUTED` score can neither sta
 matured one.
 
 ### Median-based LLM consensus and validator agreement on failures
-- L1: validators re-run the analysis and accept a leader score within +/-100.
+- L1: validators re-run the analysis and accept the leader output **only if it maps to the exact same credit tier** (see *Deterministic Economic Consensus*).
 - L2 (dispute): `resolve_dispute(borrower)` makes a **single** `run_nondet` analysis (no 3x loop, to stay
-  inside block gas limits) and relies on GenLayer's validator consensus for LLM variance. The 250-point
-  overturn threshold exceeds the worst honest disagreement (2 x 100), so noise alone cannot slash.
+  inside block gas limits) and relies on GenLayer's validator consensus for LLM variance. The two-tier
+  overturn gap exceeds the worst honest disagreement (one tier), so noise alone cannot slash.
 - If the **leader reports an evidence error**, each validator re-runs the fetch itself and **agrees only if it
   hits the same class of error** (`[DATA_UNAVAILABLE]` or `[TRANSIENT]`), so a failure can reach consensus
   instead of hanging. Malformed-LLM or unclassified leader errors are rejected to force rotation.
-- The overturn threshold (250) is wider than twice the L1 tolerance (200), so consensus noise can never slash an
-  honest evaluator. LLM output is parsed defensively and prompts treat all fetched data as untrusted.
+- The overturn gap (2 tiers) is wider than the worst honest boundary disagreement (1 tier), so consensus noise
+  can never slash an honest evaluator. LLM output is parsed defensively and prompts treat all fetched data as untrusted.
 
 ### The 404 / evidence-slash trap and counter-evidence
 During `resolve_dispute`, a `404`/`410` (or empty body) at the evaluator's `data_url` **resolves for the
@@ -206,7 +247,7 @@ every fetch, in addition to the domain whitelist.
 
 ### Freshness
 `get_max_borrow_power` returns `0` unless the score is `FINAL` and no more than 30 days old. It is the lesser of
-the unlent capacity and `score x live stake / 1000` less what is already lent.
+the unlent capacity and the live tier capacity (`TIER_CAPACITY_BPS[tier] x live stake / 10000`) less what is already lent.
 
 ---
 
@@ -281,7 +322,9 @@ Hosted Studio networks have no on-chain fee manager, so the script derives the f
 > `GENVM_VERSION` until the pin is moved to a runner that rc9 provides.
 
 The suite covers registration, SSRF and domain-whitelist rejection (data, counter and evidence URLs), finalization,
-overturned / upheld disputes (exact threshold boundaries), single-run disputes, counter-evidence, two-sided default evidence, timelocks,
+overturned / upheld disputes (exact tier-gap boundaries), single-run disputes, **adversarial validator-consensus
+tests** (borderline leader pushes a higher tier and is rejected, exact bucket equality for all 1001 scores x 4
+tiers, malformed payloads, identical capacity across every validator-compatible output, zero economic drift), counter-evidence, two-sided default evidence, timelocks,
 404 vs transient evidence errors (including the dispute timeout), validator agreement on leader errors (via
 `run_validator`) for both scoring and default verification, lender access control, the loan registry
 (multi-lender defaults, loans outliving the score, loan expiry and closure countdowns), the default dispute window
@@ -314,13 +357,54 @@ locks, the treasury route, and zero-wei accounting across end-to-end lifecycles.
 | | |
 |---|---|
 | Network | GenLayer Studio Devnet (`studio-dev`, chain id 61997) |
-| Contract | `0x4e7fB453f647dCE178B19fEC660d8c6C87e1CbCa` (current code) |
+| Contract (bucketed code) | `0x8331d963b25682e34afC4639B81026C818Ae87F8` - deployed, `raw.githubusercontent.com` whitelisted; on-chain tier-table verification still pending (see *Deployment status*) |
+| Contract (previous, superseded +/-100 code) | `0x4e7fB453f647dCE178B19fEC660d8c6C87e1CbCa` - do not use; it still has the continuous-capacity flaw |
 | Governor | `0x6Ec5cb7469a661B8E23B4867359893A25116eA19` (the deployer, a single EOA - **development only**) |
 | Whitelisted domains | `raw.githubusercontent.com` (added by `deploy/deployScript.ts` right after deployment; devnet testing/demonstration only - see the note under *Evidence-domain whitelist*) |
 
 `genlayer deploy` runs `deploy/deployScript.ts`, which deploys the contract and then calls `whitelist_domain`
 as the governor so the contract can serve score requests immediately. Change `INITIAL_DOMAIN` in the script
 for a real data source.
+
+### Deployment status (agreed-bucket contract)
+
+The bucketed contract is deployed on Studio Devnet at `0x8331d963b25682e34afC4639B81026C818Ae87F8` and the
+deploy script whitelisted `raw.githubusercontent.com`. Two earlier attempts failed server-side (the devnet
+database was out of disk, then in recovery mode). The final step of the script - reading the tier table back -
+failed because the node returned `Can't reconnect until invalid transaction is rolled back` on every read, so the
+on-chain table has **not** been verified yet. Re-check it once reads work:
+
+```
+genlayer call 0x8331d963b25682e34afC4639B81026C818Ae87F8 get_tier_table
+genlayer call 0x8331d963b25682e34afC4639B81026C818Ae87F8 get_tier_for_score --args 699
+```
+
+`deploy/deployScript.ts` ends with **deterministic state verification**: it reads `get_tier_table()` and
+`get_tier_for_score()` from the chain and throws unless the floors are `[0, 500, 700, 850]`, the capacities are
+`[0, 5000, 8000, 10000]`, and every boundary score (0, 499, 500, 699, 700, 849, 850, 1000) maps to its tier. (Do not pass `--contract` to `genlayer deploy`: that
+bypasses the script and its fee derivation and the chain rejects the deposit with `FeeValueMustBeNonZero(1)`.)
+
+### Test run evidence
+
+```
+$ pytest tests -q
+....................................................................     [100%]
+284 passed in 24.19s
+
+$ pytest tests -v -k "borderline or rejects_any or exactly_bucket or malformed or identical_capacity or zero_economic or every_boundary"
+test_borderline_leader_cannot_push_borrower_into_higher_tier PASSED
+test_validator_rejects_any_leader_tier_other_than_its_own[699-2] PASSED   # validator 699 vs forged tier 2
+test_validator_rejects_any_leader_tier_other_than_its_own[849-3] PASSED
+test_acceptance_is_exactly_bucket_equality_for_every_score PASSED         # 1001 scores x 4 tiers
+test_malformed_leader_payloads_are_rejected[...] PASSED                   # 11 forged payload shapes
+test_every_validator_compatible_output_yields_identical_capacity PASSED
+test_zero_economic_drift_across_independent_validators PASSED             # accepting set == 700..849 exactly
+test_borrow_capacity_is_bound_to_bucket_at_every_boundary[...] PASSED     # 8 boundary scores
+```
+
+Mutation check: replacing the validator's tier equality with a +/-100 style tolerance makes 13 of these
+tests fail, so they do detect the original flaw. (Run with the working GenVM runtime pinned, e.g.
+`GENVM_VERSION=v0.6.0-rc8 pytest tests`.)
 
 ### Testing `request_score_update`
 

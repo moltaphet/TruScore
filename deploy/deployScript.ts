@@ -25,6 +25,16 @@ const RETRIES = 200;
 // and a fresh contract rejects every data_url until a domain is listed.
 const INITIAL_DOMAIN = "raw.githubusercontent.com";
 
+// The consensus-critical bucket table the deployed bytecode MUST expose. Validators
+// agree on the TIER and capacity is a pure function of (tier, stake), so a deployment
+// whose table differs from the one documented in the README is rejected here.
+const EXPECTED_FLOORS = [0, 500, 700, 850];
+const EXPECTED_CAPACITY_BPS = [0, 5000, 8000, 10000];
+// [score, expected tier]: every boundary of every tier.
+const EXPECTED_TIER_OF_SCORE: Array<[number, number]> = [
+  [0, 0], [499, 0], [500, 1], [699, 1], [700, 2], [849, 2], [850, 3], [1000, 3],
+];
+
 interface DeployReceipt {
   status?: number | string;
   statusName?: string;
@@ -58,6 +68,11 @@ interface DeployClient {
     args: unknown[];
     fees?: TransactionFees;
   }): Promise<string>;
+  readContract?(input: {
+    address: string;
+    functionName: string;
+    args: unknown[];
+  }): Promise<unknown>;
   waitForTransactionReceipt(input: {
     hash: string;
     waitUntil: "decided" | "finalized";
@@ -99,6 +114,45 @@ function contractAddressFrom(receipt: DeployReceipt): string | undefined {
   const raw = receipt as unknown as Record<string, unknown>;
   const direct = raw.contractAddress ?? raw.contract_address;
   return typeof direct === "string" ? direct : undefined;
+}
+
+const toNumbers = (value: unknown): number[] =>
+  (Array.isArray(value) ? value : []).map((v) => Number(v));
+
+/**
+ * Deterministic state verification: read the bucket table back from the chain and
+ * fail the deployment if any floor, capacity or boundary mapping is not exactly the
+ * documented one. Every validator-compatible output then preserves the same capacity.
+ */
+async function verifyTierTable(client: DeployClient, address: string): Promise<void> {
+  if (typeof client.readContract !== "function") {
+    console.log(
+      "readContract unavailable on this client: verify with `genlayer call " +
+        `${address} get_tier_table` + "`.",
+    );
+    return;
+  }
+  const raw = (await client.readContract({
+    address,
+    functionName: "get_tier_table",
+    args: [],
+  })) as Record<string, unknown> | Map<string, unknown>;
+  const get = (k: string) => (raw instanceof Map ? raw.get(k) : raw[k]);
+  const floors = toNumbers(get("floors"));
+  const caps = toNumbers(get("capacity_bps"));
+  if (JSON.stringify(floors) !== JSON.stringify(EXPECTED_FLOORS)) {
+    throw new Error(`Tier floors mismatch: ${JSON.stringify(floors)}`);
+  }
+  if (JSON.stringify(caps) !== JSON.stringify(EXPECTED_CAPACITY_BPS)) {
+    throw new Error(`Tier capacities mismatch: ${JSON.stringify(caps)}`);
+  }
+  for (const [score, tier] of EXPECTED_TIER_OF_SCORE) {
+    const got = Number(
+      await client.readContract({ address, functionName: "get_tier_for_score", args: [score] }),
+    );
+    if (got !== tier) throw new Error(`Score ${score} mapped to tier ${got}, expected ${tier}`);
+  }
+  console.log(`Verified tier table: floors=${floors} capacity_bps=${caps}`);
 }
 
 export default async function main(client: DeployClient): Promise<string> {
@@ -153,5 +207,7 @@ export default async function main(client: DeployClient): Promise<string> {
     );
   }
   console.log(`Whitelisted domain ${INITIAL_DOMAIN}`);
+
+  await verifyTierTable(client, address);
   return address;
 }
