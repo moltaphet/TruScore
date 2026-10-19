@@ -356,9 +356,12 @@ locks, the treasury route, and zero-wei accounting across end-to-end lifecycles.
 
 | | |
 |---|---|
-| Network | GenLayer Studio Devnet (`studio-dev`, chain id 61997) |
-| Contract (bucketed code) | `0x8331d963b25682e34afC4639B81026C818Ae87F8` - deployed, `raw.githubusercontent.com` whitelisted; on-chain tier-table verification still pending (see *Deployment status*) |
-| Contract (previous, superseded +/-100 code) | `0x4e7fB453f647dCE178B19fEC660d8c6C87e1CbCa` - do not use; it still has the continuous-capacity flaw |
+| Network | GenLayer Studio Next (`studio-next`, chain id 61997, RPC `https://studio-next.genlayer.com/api`) |
+| Contract (bucketed code, **current**) | `0xa433363Cc68539bc3cbB955f5ABa1902892EEd18` - deployed, `raw.githubusercontent.com` whitelisted, tier table verified on-chain |
+| Deploy transaction | `0x0a945aa27b6f000565f180258467c51a2b95bdb793cd962c251359d4825bea65` (FINALIZED) |
+| Source SHA-256 | `007728fda2a4495565d4fc9ad25d53fe27a88da71e4d254578aa0235817ed87b` (`contracts/truscore_oracle.py`; identical to the on-chain code, see *Verifying the deployment*) |
+| Contract (superseded, Studio Devnet) | `0x8331d963b25682e34afC4639B81026C818Ae87F8` - tier table was never verified on-chain; do not use |
+| Contract (superseded, Studio Devnet, +/-100 code) | `0x4e7fB453f647dCE178B19fEC660d8c6C87e1CbCa` - do not use; it still has the continuous-capacity flaw |
 | Governor | `0x6Ec5cb7469a661B8E23B4867359893A25116eA19` (the deployer, a single EOA - **development only**) |
 | Whitelisted domains | `raw.githubusercontent.com` (added by `deploy/deployScript.ts` right after deployment; devnet testing/demonstration only - see the note under *Evidence-domain whitelist*) |
 
@@ -368,15 +371,22 @@ for a real data source.
 
 ### Deployment status (agreed-bucket contract)
 
-The bucketed contract is deployed on Studio Devnet at `0x8331d963b25682e34afC4639B81026C818Ae87F8` and the
-deploy script whitelisted `raw.githubusercontent.com`. Two earlier attempts failed server-side (the devnet
-database was out of disk, then in recovery mode). The final step of the script - reading the tier table back -
-failed because the node returned `Can't reconnect until invalid transaction is rolled back` on every read, so the
-on-chain table has **not** been verified yet. Re-check it once reads work:
+The bucketed contract is deployed on Studio Next at `0xa433363Cc68539bc3cbB955f5ABa1902892EEd18`
+(deploy tx `0x0a945aa2...bea65`; `whitelist_domain("raw.githubusercontent.com")` is tx `0x11aafc64...368b9`). The deploy
+script read `get_tier_table()` back from the chain and it matched. The earlier devnet deployment
+(`0x8331d963...`) could not be verified because reads failed with `Can't reconnect until invalid transaction is rolled
+back`; it is superseded so that the GitHub source and the on-chain bytecode cannot diverge again.
+
+### Verifying the deployment
+
+The deployed bytecode must hash to the source hash above:
 
 ```
-genlayer call 0x8331d963b25682e34afC4639B81026C818Ae87F8 get_tier_table
-genlayer call 0x8331d963b25682e34afC4639B81026C818Ae87F8 get_tier_for_score --args 699
+curl -s -X POST https://studio-next.genlayer.com/api -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"gen_getContractCode","params":["0xa433363Cc68539bc3cbB955f5ABa1902892EEd18"]}' \
+  | python3 -c "import sys,json,base64,hashlib;print(hashlib.sha256(base64.b64decode(json.load(sys.stdin)['result'])).hexdigest())"
+shasum -a 256 contracts/truscore_oracle.py
+genlayer call 0xa433363Cc68539bc3cbB955f5ABa1902892EEd18 get_tier_table
 ```
 
 `deploy/deployScript.ts` ends with **deterministic state verification**: it reads `get_tier_table()` and
@@ -423,7 +433,7 @@ data_url: https://raw.githubusercontent.com/truscore-demo/sample-data/main/borro
 ```
 
 ```
-genlayer write 0x4e7fB453f647dCE178B19fEC660d8c6C87e1CbCa request_score_update \
+genlayer write 0xa433363Cc68539bc3cbB955f5ABa1902892EEd18 request_score_update \
   --args 0x000000000000000000000000000000000000dEaD https://raw.githubusercontent.com/truscore-demo/sample-data/main/borrower.json
 ```
 

@@ -1,0 +1,18 @@
+{
+  "network": "studio-next",
+  "chainId": 61997,
+  "rpc": "https://studio-next.genlayer.com/api",
+  "contract": "0xa433363Cc68539bc3cbB955f5ABa1902892EEd18",
+  "deployTx": "0x0a945aa27b6f000565f180258467c51a2b95bdb793cd962c251359d4825bea65",
+  "whitelistDomainTx": "0x11aafc6424038d5204a28bd0214901bdeeb9b922f82ed5fe570d2d98e5b368b9",
+  "governor": "0x6Ec5cb7469a661B8E23B4867359893A25116eA19",
+  "sourcePath": "contracts/truscore_oracle.py",
+  "sourceSha256": "007728fda2a4495565d4fc9ad25d53fe27a88da71e4d254578aa0235817ed87b",
+  "tierFloors": [0, 500, 700, 850],
+  "tierCapacityBps": [0, 5000, 8000, 10000],
+  "whitelistedDomains": ["raw.githubusercontent.com"],
+  "supersedes": [
+    "0x8331d963b25682e34afC4639B81026C818Ae87F8",
+    "0x4e7fB453f647dCE178B19fEC660d8c6C87e1CbCa"
+  ]
+}
